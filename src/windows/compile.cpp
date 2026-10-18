@@ -102,12 +102,144 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         degrade(CapId::proc_isolation);
         report.record(CapId::proc_isolation, Enforcement::none, "appcontainer unavailable");
     }
+    // the read wall rides on restricted tokens; the host capability already
+    // carries a PROBE VERDICT (a real child ran and exited cleanly), not an
+    // API-existence guess. see spawn.cpp step 7.
+    out.restricted_tokens_ok = host.restricted_tokens;
 
     // -- filesystem --------------------------------------------------------
+    //
+    // ── windows path shape ───────────────────────────────────────
+    //
+    // claybin's policy layer is POSIX-shaped by design (path::normalize
+    // treats / as the only separator, so "C:\\Windows" normalizes to
+    // "/C:\\Windows" and prefix tests like covers() are then wrong in both
+    // directions). the windows backend therefore re-normalizes every grant
+    // path into a canonical native form ONCE, here, before it becomes an ACL
+    // target:
+    //
+    //   "/C:\\Windows"  →  "C:\\Windows"   (posix-normalized back to native)
+    //   "C:\\x/..\\y"  →  "C:\\y"          (mixed separators collapse)
+    //   "C:\\a\\b\\"    →  "C:\\a\\b"       (no trailing separators)
+    //
+    // pseudo-filesystem roots (/proc, /dev) resolve to this sentinel: the
+    // path translates, but the grant loop below SKIPS it. the appcontainer's
+    // object-namespace default-deny (graded `partial`) is the isolation
+    // these policy roots ask for.
+    static constexpr char kVirtualObjectNS[] = "\\\\.\\virtual-object-namespace";
+    //
+    // a path with no drive prefix is REJECTED: what a relative path resolves
+    // against is the caller's cwd, an authority that names no boundary at
+    // all, and an ACL on something we cannot pin down is a grant we cannot
+    // reason about. a policy that names one is malformed rather than merely
+    // unusual -- fail loudly instead of stamping ACLs at the wrong object.
+    auto native_path = [](std::string_view p) -> Result<std::string> {
+        if (p.empty()) return std::unexpected(Error{Errc::invalid_policy, "empty path"});
+
+        std::string_view s = p;
+
+        // a leading slash in front of a drive letter is claybin's posix-
+        // normalized spelling of a NATIVE windows path ("/C:/work" ==
+        // "C:\\work", what builder("C:/work") becomes once path::normalize
+        // runs). it is host vocabulary, not policy vocabulary: strip it BEFORE
+        // the root table below so a native path is never mistaken for a
+        // portable root.
+        if (s.size() >= 3 && s[0] == '/' && s[1] >= 'A' && s[1] <= 'Z' && s[2] == ':')
+            s.remove_prefix(1);
+
+    // a path with no drive prefix is REJECTED -- unless it is one of claybin's
+    // canonical POSIX system roots, which are POLICY VOCABULARY rather than
+    // host paths: `system_ro()` names "/usr" and "/bin" because the same
+    // policy shape compiles on every platform, and the windows backend owns
+    // translating them. an unmapped relative path still fails loudly: what a
+    // bare "foo" resolves against is the caller's cwd, an authority that
+    // names no boundary at all.
+    static const struct { const char* posix; const char* native; } kSystemRoots[] = {
+        {"/usr",  "C:\\Windows"},                 // toolchain + libs, read-only
+        {"/bin",  "C:\\Windows\\System32"},       // executables
+        {"/lib",  "C:\\Windows\\System32"},       // loader + shared libraries
+        {"/lib64", "C:\\Windows\\System32"},
+        {"/sbin", "C:\\Windows\\System32"},
+        {"/etc",  "C:\\Windows\\System32\\config"}, // machine config; HKLM's on-disk half
+        // pseudo-filesystems from the portable policy vocabulary. windows has
+        // no procfs/devfs; the AppContainer's object-namespace default-deny
+        // (graded `partial` below) is what stands in for their isolation.
+        // these roots resolve to the "virtual" sentinel below: the path
+        // translates successfully, and the grant loop SKIPS it -- no ACL can
+        // be stamped on an object namespace, and mapping them to a real
+        // directory would be a GRANT, the opposite of what dev_fs("/dev")
+        // means.
+        {"/proc", kVirtualObjectNS},
+        {"/dev",  kVirtualObjectNS},
+        // the portable shapes' workspace vocabulary. a policy that says
+        // builder("/work") asks for "a place the guest may write"; the exact
+        // directory is the caller's to pin with a native path when it
+        // matters, and this mapping keeps the portable shape compiling.
+        {"/work", "C:\\claybin-work"},
+        {"/tmp",  "C:\\claybin-tmp"},
+        {"/app",  "C:\\claybin-app"},
+        {"/home", "C:\\Users"},
+    };
+    if (!s.empty() && s.front() == '/') {
+        for (const auto& m : kSystemRoots) {
+            const std::string_view pp = m.posix;
+            if (s != pp && !(s.size() > pp.size() && s.starts_with(pp) &&
+                             s[pp.size()] == '/'))
+                continue;
+            if (m.native[0] == '\0')
+                return std::unexpected(Error{Errc::unsupported,
+                    std::string("no windows mapping for policy root '") + m.posix +
+                    "'; name a native path instead"});
+            // splice the remainder after the root onto the native path
+            std::string rest{s.substr(pp.size())};  // "" or "/sub/..."
+            for (char& ch : rest) if (ch == '/') ch = '\\';
+            return std::string{m.native} + rest;
+        }
+        return std::unexpected(Error{Errc::unsupported,
+            "unmapped policy root '" + std::string{s} +
+              "'; windows knows /usr /bin /lib /lib64 /sbin /etc"});
+      }
+
+          // past the policy-vocabulary roots: native forms only, with the
+          // drive prefix already stripped above. anything else starting with
+          // "/" failed the root table and never reaches here.
+          std::string out;
+          out.reserve(s.size());
+          bool prev_sep = false;
+          for (const char c : s) {
+              if (c == '/' || c == '\\') {
+                  if (!prev_sep && !out.empty()) out.push_back('\\');
+                  prev_sep = true;
+              } else {
+                  out.push_back(c);
+                  prev_sep = false;
+              }
+          }
+          while (!out.empty() && out.back() == '\\') out.pop_back();
+          if (out.empty())
+              return std::unexpected(Error{Errc::invalid_policy, "path normalizes to nothing"});
+
+          const bool drive = out.size() >= 2 && out[1] == ':' &&
+                             ((out[0] >= 'A' && out[0] <= 'Z') ||
+                              (out[0] >= 'a' && out[0] <= 'z'));
+          const bool unc = out.size() >= 2 && out[0] == '\\' && out[1] == '\\';
+          if (!drive && !unc)
+              return std::unexpected(Error{Errc::invalid_policy,
+                  "path has no drive prefix (need C:\\... or \\\\server\\\\share)"});
+          return out;
+    };
+
     for (const auto& g : effective.grants()) {
+        auto native = native_path(g.path);
+        if (!native)
+            return std::unexpected(native.error());
+        // /proc and /dev translate to the virtual object namespace: nothing
+        // to stamp an ACL on (and stamping one would be a grant, not an
+        // isolation). the appcontainer default-deny carries the isolation.
+        if (*native == std::string_view{kVirtualObjectNS}) continue;
         std::uint32_t mask = to_access_mask(g.rights);
         if (mask == (kSynchronize | kReadControl)) continue;  // nothing substantive
-        out.acl_grants.emplace_back(g.path, mask);
+        out.acl_grants.emplace_back(std::move(*native), mask);
     }
 
     if (!host.app_container) {

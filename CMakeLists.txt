@@ -78,6 +78,17 @@ if(APPLE)
     src/core/fd.cpp
     src/macos/spawn.cpp)
 endif()
+
+# The Windows apply path. Same split as linux/macos: compile.cpp is pure and
+# builds everywhere (its tests run in CI on a linux runner), spawn.cpp calls
+# the AppContainer/Job/CreateProcess APIs and only exists on windows.
+# Conditional rather than unconditional so the MSVC/MinGW library link keeps
+# working for agentty's settings pane (which compiles plans on windows to
+# preview walls) while the apply step only lands where it can work.
+if(WIN32)
+  target_sources(claybin PRIVATE src/windows/spawn.cpp)
+  target_link_libraries(claybin PUBLIC userenv advapi32)
+endif()
 target_include_directories(claybin PUBLIC include)
 # GNU-style flags are GNU-ONLY. MSVC takes `/W4` and treats `-Wextra` as a
 # malformed `/W` -- `cl : Command line error D8021 : invalid numeric argument
@@ -150,6 +161,11 @@ if(CLAYBIN_TESTS)
   # the apply path, which can only be meaningful on a mac: it enters a real
   # seatbelt sandbox and asserts the walls hold. skips itself elsewhere.
   claybin_test(macos_live_check)
+  # the windows apply path: a real AppContainer profile, real ACLs, a real
+  # confined child. windows-only, because only a windows host can mean it.
+  if(WIN32)
+    claybin_test(windows_live_check)
+  endif()
   claybin_test(compile_fuzz_test)
 
   # the syscall tables get an extra translation unit: it compiles the aarch64
