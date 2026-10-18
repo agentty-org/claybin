@@ -26,7 +26,7 @@ which walls the host could actually build.
 see [docs/bubblewrap.md](docs/bubblewrap.md) for the porting guide.
 
 it owns no event loop. supervising a sandboxed process is an event-loop job, and
-that job belongs to [jaal](https://github.com/1ay1/jaal) — see
+that job belongs to [jaal](https://github.com/agentty-org/jaal) — see
 [docs/jaal.md](docs/jaal.md).
 
 > **Status: early — read this before using it for anything that matters.**
