@@ -64,9 +64,9 @@ that the ranking is per-capability, not per-OS.
 what a policy compiles to, per capability, on a modern host. the linux column is
 measured on this machine (landlock abi 10, cgroup v2 delegated); the macOS
 column is measured on darwin 24 (`tests/macos_live_check.cpp` enters the
-profile and asserts the walls hold); the windows column is what
-`src/windows/compile.cpp` reports and is unit-tested, though the apply step is
-not written yet.
+profile and asserts the walls hold); the windows column is measured on windows
+11 insider (`tests/windows_live_check.cpp` creates the profile, stamps real
+ACLs and spawns a real confined child).
 
 | capability | linux | windows | macOS |
 |---|---|---|---|
@@ -151,7 +151,10 @@ beyond that is a per-platform decision the caller has to make explicitly.
    so it is the only place the design can be validated end to end. *done.*
 2. **windows second.** job objects and AppContainer are well documented and the
    model is genuinely strong; the filesystem translation is the real work.
-   *compile step done and unit-tested; apply step not written.*
+   *done: compile step in `src/windows/compile.cpp`, apply step in
+   `src/windows/spawn.cpp` (appcontainer profile + DACL/integrity grants,
+   restricted token where the host proves it usable, job object, mitigation
+   policies), live-checked in `tests/windows_live_check.cpp`.*
 3. **macOS third.** seatbelt is deprecated-but-universal (chrome still uses it),
    undocumented, and the App Sandbox alternative needs entitlements and code
    signing, which rules out sandboxing arbitrary binaries. *done: compile step
@@ -223,3 +226,61 @@ reasons: doing it after requires the profile to permit `open("/dev/null")` and
 to stderr when a profile is refused. with stderr not yet redirected, that
 message lands on the caller's terminal instead of in the pipe they supplied for
 exactly this purpose.
+
+## notes from writing the windows backend
+
+recorded the same way, because windows cost the most debugging time per line
+of code.
+
+### the probe must be process-lifetime cached
+
+the restricted-token + appcontainer child probe is **process-warmth
+dependent** on some builds (insider 26300 measured): early calls in a process
+report death, later ones -- after enough real spawns -- report success. a
+`compile()` that re-probes per call can therefore see a verdict that
+contradicts the caller's own measurement minutes earlier, and build a wall
+that kills every guest with 0xC0000142 during ntdll init. the verdict is now
+taken once, from the coldest call, in a function-local `const` static (a
+magic static: thread-safe once-init, and the vendored-library lint rejects
+both `<atomic>` and mutable statics).
+
+the corollary: a probe verdict that overpromises is worse than none. the
+probe child must run in the **exact production spawn shape** -- writable
+command line (with `lpApplicationName=nullptr` createprocess parses and
+modifies it, so a string literal there is an access violation),
+CREATE_SUSPENDED, assigned to a job before resume, PROC_THREAD_ATTRIBUTE_
+HANDLE_LIST, the real restricted list (BUILTIN\Users + Everyone, not the
+near-no-op user-SID list) -- and must survive **three** runs, because one
+pass means nothing on a host where the combo is flaky.
+
+### graceful stop cannot reach grandchildren
+
+an adopted child carries no job handle in the host's process abstraction, so
+a graceful stop is TerminateProcess on the LEADER only. a grandchild
+(`ping` inside `cmd`) survives it and keeps the stdout pipe open -- and the
+post-exit drain then waits for the grandchild to finish naturally (measured:
+19.9 s for `ping -n 21`; after the fix: 0.35 s). the exec loop therefore
+fires the sandbox's exact tree kill (TerminateJobObject) BEFORE the graceful
+stop, and keeps the grace window only as a fallback. "ask first, then kill"
+is a posix shape; on windows the order is "kill the tree, then flush".
+
+### /proc and /dev are policy roots without filesystems
+
+the portable policy vocabulary binds procfs and devfs; windows has neither.
+mapping the roots to a real directory would be a GRANT -- the opposite of
+what a policy asking for dev_fs("/dev") means -- so they resolve to a
+virtual-object-namespace sentinel and the grant loop skips them: nothing to
+stamp an ACL on, and the appcontainer's default-deny is the isolation those
+roots asked for.
+
+### profiles are state on disk, and the appx service wedges
+
+CreateAppContainerProfile leaves a directory under %LOCALAPPDATA%\Packages
+keyed by the profile name (claybin suffixes a hash of the capability set, so
+different capability sets never share one). two operational notes: a probe
+that crashes between create and delete leaves the profile behind, and the
+next run must tolerate ERROR_ALREADY_EXISTS by deriving the existing SID
+rather than failing; and on insider builds the appx deployment service can
+wedge after hundreds of create/delete cycles (0x800706C6,
+RPC_S_SERVER_UNAVAILABLE), which looks like a code failure but is host
+state -- a reboot clears it, a service restart often does not.

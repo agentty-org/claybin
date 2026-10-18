@@ -35,7 +35,11 @@ that job belongs to [jaal](https://github.com/1ay1/jaal) — see
 >
 > **works and is tested.** the mount model, landlock (including abi 6 scoping),
 > seccomp with argument filtering, cgroup2 memory/pids/cpu limits, the policy
-> algebra, and seccomp-notify brokering. 19 test binaries, an escape corpus of
+> algebra, and seccomp-notify brokering. the macOS port (seatbelt + rlimits,
+> live-checked on darwin 24) and the Windows port (appcontainer + restricted
+> token + job object, live-checked on windows 11 insider; see
+> docs/platforms.md "notes from writing the windows backend") are applied and
+> measured on their hosts rather than promised. 19 test binaries, an escape corpus of
 > 47 named attacks that spawns real processes and tries to break out (46
 > blocked, 0 escaped, 1 not applicable on this kernel), a differential BPF
 > interpreter, 1.28M fuzzed policies, and 57 conformance checks against real
@@ -44,8 +48,9 @@ that job belongs to [jaal](https://github.com/1ay1/jaal) — see
 >
 > **not tested.** aarch64 and riscv64 have never executed — the aarch64 syscall
 > tables are cross-checked against the kernel's own headers, which is not the
-> same thing. macOS and Windows compile a plan but cannot apply one. only two
-> kernels have ever run this (6.8 and 7.2).
+> same thing. only two linux kernels have ever run this (6.8 and 7.2); macOS
+> and Windows each ran the port's own live checks on their respective hosts
+> (darwin 24, windows 11 insider 26300) but no CI lane exercises either.
 >
 > **known open.** `bind_fd` has a TOCTOU window between resolving the descriptor
 > and mounting its path. it is not closable from inside claybin — both
