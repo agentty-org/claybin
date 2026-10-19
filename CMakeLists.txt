@@ -89,6 +89,8 @@ endif()
 if(WIN32)
   target_sources(claybin PRIVATE src/windows/spawn.cpp)
   target_link_libraries(claybin PUBLIC userenv advapi32)
+  # AppContainer APIs need Win8+ headers; mingw defaults older.
+  target_compile_definitions(claybin PUBLIC _WIN32_WINNT=0x0A00)
 endif()
 target_include_directories(claybin PUBLIC include)
 # GNU-style flags are GNU-ONLY. MSVC takes `/W4` and treats `-Wextra` as a

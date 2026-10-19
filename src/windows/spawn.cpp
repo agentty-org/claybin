@@ -633,6 +633,8 @@ Result<HANDLE> make_job(const Compiled& c) {
 // its initialization is thread-safe and happens exactly once, which keeps
 // this file inside the vendored-library rules (no <atomic>, no mutable
 // statics).
+HostCapabilities probe_host_uncached();
+
 HostCapabilities cached_host_probe() {
     static const HostCapabilities cached = probe_host_uncached();
     return cached;
