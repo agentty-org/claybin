@@ -300,6 +300,15 @@ class SyscallPolicy {
 
     const std::vector<ArgRule>& arg_rules() const { return arg_rules_; }
 
+    // remove every argument rule on one syscall argument. used to lift the
+    // profiles' W^X rule for a JIT.
+    SyscallPolicy& drop_arg_rules(SysNr nr, std::uint8_t arg_index) {
+        std::erase_if(arg_rules_, [&](const ArgRule& r) {
+            return r.nr == nr && r.arg_index == arg_index;
+        });
+        return *this;
+    }
+
     SysAction action_for(SysNr nr) const {
         // rules_ is sorted, so this is a binary search in the hot audit path.
         auto it = std::lower_bound(rules_.begin(), rules_.end(), nr,

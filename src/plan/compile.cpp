@@ -565,13 +565,17 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                                      Ref{}, kMsBind | kMsRemount | kMsRdonly | kMsNosuid |
                                                 kClayMountOptional});
                     }
-                    // and the whole of /proc/sys, which is a large and
-                    // ever-growing attack surface. a read-only bind of an empty
-                    // tmpfs is the standard container answer.
+                    // /proc/sys read-only, the way docker does it. not empty:
+                    // V8 aborts at startup without /proc/sys/vm. the recursive
+                    // bind keeps the masks above.
+                    const std::string sys = dst + "/sys";
                     b.op(OpCode::mount,
-                         MountOp{b.intern("tmpfs"), b.intern(dst + "/sys"), b.intern("tmpfs"),
-                                 Ref{}, kMsNosuid | kMsNodev | kMsNoexec | kMsRdonly |
-                                            kClayMountOptional});
+                         MountOp{b.intern(sys), b.intern(sys), b.intern("none"), Ref{},
+                                 kMsBind | kMsRec | kMsNosuid | kClayMountOptional});
+                    b.op(OpCode::mount,
+                         MountOp{b.intern("none"), b.intern(sys), b.intern("none"), Ref{},
+                                 kMsBind | kMsRemount | kMsRdonly | kMsNosuid | kMsNodev |
+                                     kMsNoexec | kClayMountOptional});
 
                     report.record(CapId::device_isolation, Enforcement::partial,
                                   "procfs leak masking");
