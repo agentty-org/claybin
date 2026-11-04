@@ -118,6 +118,29 @@ int main() {
         CHECK(run_in(*c, cmd) != 0);
     }
 
+    // -- the mach wall: launchd services are confused deputies -------------
+    // with a bare (allow mach-lookup) every one of these succeeded under a
+    // profile with no home grant and no network: the pasteboard handed back
+    // its contents, security(1) listed the login keychain, launchctl walked
+    // the GUI domain. none of it is a file or a socket, so only the mach
+    // allowlist stops it.
+    CHECK(run_in(*c, "/usr/bin/pbpaste") != 0);
+    CHECK(run_in(*c, "/usr/bin/security list-keychains | grep -q keychain") != 0);
+    // Apple Events and LaunchServices: driving another app, or launching
+    // one, would run code with the USER's authority outside the sandbox.
+    CHECK(run_in(*c, "/usr/bin/osascript -e 'tell application \"System Events\" to name of first process'") != 0);
+    CHECK(run_in(*c, "/usr/bin/open -g -a Calculator") != 0);
+    // NOT checked: `launchctl print`. it talks to launchd over the bootstrap
+    // port every process is born holding -- no mach-lookup involved, so no
+    // profile can withhold it. it is read-only; `submit` is refused.
+
+    // ...and the allowlist is not so tight that ordinary tools break. a
+    // sandbox that kills `id` or a pty looks exactly like a broken one.
+    // (`ps` is setuid root, and seatbelt refuses setuid exec outright --
+    // that is the platform, under any profile, not this allowlist.)
+    CHECK_EQ(run_in(*c, "/usr/bin/id -un | grep -qv '^[0-9]*$'"), 0);
+    CHECK_EQ(run_in(*c, "/usr/bin/script -q /dev/null /usr/bin/true"), 0);
+
     // -- a failed sandbox must never run the program -----------------------
     // the most important property in the whole backend: if sandbox_init fails,
     // the child must die rather than exec unconfined. feed it a profile the

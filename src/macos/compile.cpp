@@ -160,6 +160,55 @@ void emit_rule(std::string& p, const char* verb, const char* op, std::string_vie
     if (!resolved.empty()) emit_rule(p, verb, op, resolved);
 }
 
+// stat(2) on every ANCESTOR of `path`, and nothing else.
+//
+// the reason this exists: a blanket (allow file-read-metadata) is a disk-wide
+// oracle. measured with it on, a guest with no home grant could stat(2) any
+// path -- "does ~/.ssh/id_ed25519 exist", its size and mtime, the shape of
+// every project on the machine. listing (readdir) stayed walled, and so did
+// content; existence and metadata did not.
+//
+// what a grant actually needs is traversal of the path DOWN to it: realpath,
+// getcwd, git's repo discovery and node's module resolution all lstat each
+// component. so: (literal) on each ancestor, which stats that directory
+// entry and lists nothing beneath it.
+void emit_ancestor_metadata(std::string& p, std::string_view path) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const std::string full = pass == 0 ? std::string{path} : darwin_firmlink(path);
+        if (full.empty()) continue;
+        for (std::size_t i = 1; i < full.size(); ++i) {
+            if (full[i] != '/') continue;
+            std::string quoted;
+            if (!sbpl_quote(std::string_view{full}.substr(0, i), quoted)) return;
+            p += "(allow file-read-metadata (literal ";
+            p += quoted;
+            p += "))\n";
+        }
+    }
+}
+
+// with no blanket mach-lookup, name resolution and TLS trust are mach
+// services, not sockets: getaddrinfo asks mDNSResponder, Security.framework
+// asks trustd. a guest granted the network but not these gets "could not
+// resolve host". emitted ONLY on a network-allowing profile, never in the
+// prerequisites, so a no-network guest has no DNS side channel.
+// com.apple.SecurityServer (securityd) is deliberately ABSENT: it is the
+// keychain daemon, and TLS verifies fine through trustd alone -- measured
+// with curl, git, python urllib and node fetch.
+void emit_resolver_grants(std::string& p) {
+    p += "(allow mach-lookup\n"
+         "  (global-name \"com.apple.dnssd.service\")\n"
+         "  (global-name \"com.apple.mDNSResponder\")\n"
+         "  (global-name \"com.apple.SystemConfiguration.DNSConfiguration\")\n"
+         "  (global-name \"com.apple.SystemConfiguration.configd\")\n"
+         "  (global-name \"com.apple.networkd\")\n"
+         "  (global-name \"com.apple.trustd\")\n"
+         "  (global-name \"com.apple.trustd.agent\")\n"
+         "  (global-name \"com.apple.ocspd\"))\n";
+    p += "(allow file-read* (literal \"/private/var/run/mDNSResponder\"))\n";
+    p += "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n";
+}
+
 // the grants a dynamically linked darwin binary needs before main(). without
 // these the guest dies in dyld with no useful message, and the user concludes
 // the sandbox is broken rather than that it is working.
@@ -181,15 +230,60 @@ void emit_prerequisites(std::string& p) {
     // the shared cache is one giant mapped file; every linked binary needs it.
     p += "(allow file-read* (subpath \"/usr/lib\"))\n";
     p += "(allow file-read* (subpath \"/System/Library\"))\n";
-    p += "(allow file-read-metadata)\n";
+    // NOT a blanket (allow file-read-metadata): see emit_ancestor_metadata.
+    // the root's own children are stat-able so `ls -l /` and path walks work;
+    // granted subtrees get metadata through their file-read* grant, and the
+    // path down to each one through its ancestors.
+    p += "(allow file-read-metadata (regex #\"^/[^/]+$\"))\n";
+    // dyld stats these on every exec, before any grant applies.
+    p += "(allow file-read-metadata (subpath \"/private/var/db/dyld\")"
+         " (subpath \"/System/Volumes/Preboot/Cryptexes\"))\n";
     // mapping a dylib out of the shared cache is its own operation on modern
     // macOS, separate from being allowed to read the file.
     p += "(allow file-map-executable)\n";
     // sysctl reads: libSystem queries hw.ncpu / kern.osversion during startup.
     p += "(allow sysctl-read)\n";
-    // the bootstrap port, for anything that touches libdispatch or CF.
-    p += "(allow mach-lookup)\n";
+    // MACH SERVICES, BY NAME. a bare `(allow mach-lookup)` is the single
+    // widest hole a seatbelt profile can have: every launchd service is a
+    // confused deputy running OUTSIDE the sandbox. measured with it on, under
+    // `(deny network*)` and no home grant, a guest could read the pasteboard
+    // (pbpaste), enumerate keychains (security), and query launchd -- none of
+    // which touch a file or a socket the profile mediates. so: the allowlist
+    // Chrome's renderer and Codex converged on, and nothing else.
+    //   opendirectoryd.libinfo   getpwuid/getgrgid -- `id`, `ls -l`, git
+    //   logd / diagnosticd       os_log from libSystem; harmless sinks
+    //   PowerManagement.control  caffeinate-style assertions; node/pytorch
+    //   cfprefsd.daemon/agent    read-only CFPreferences for CF tools
+    //   bsd.dirhelper            confstr(DARWIN_USER_TEMP_DIR) -- without
+    //                            it xcrun, python and git fail at startup
+    //   opendirectoryd.membership getgroups/ACL checks
+    //   notification_center      notify(3): timezone/locale change pings
+    p += "(allow mach-lookup\n"
+         "  (global-name \"com.apple.system.opendirectoryd.libinfo\")\n"
+         "  (global-name \"com.apple.system.opendirectoryd.membership\")\n"
+         "  (global-name \"com.apple.system.notification_center\")\n"
+         "  (global-name \"com.apple.bsd.dirhelper\")\n"
+         "  (global-name \"com.apple.system.logger\")\n"
+         "  (global-name \"com.apple.logd\")\n"
+         "  (global-name \"com.apple.diagnosticd\")\n"
+         "  (global-name \"com.apple.PowerManagement.control\")\n"
+         "  (global-name \"com.apple.cfprefsd.daemon\")\n"
+         "  (global-name \"com.apple.cfprefsd.agent\"))\n";
     p += "(allow file-read* file-write* (literal \"/dev/null\"))\n";
+    // openpty(): `script`, expect, python's pty, any test harness spawning a
+    // shell. ttys the guest opens itself carry the pty extension; one handed
+    // in before sandbox_init does not, so ioctl (isatty/tcgetattr) is granted
+    // separately -- without it an interactive shell decides it has no tty.
+    p += "(allow pseudo-tty)\n";
+    p += "(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n";
+    p += "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\")"
+         " (extension \"com.apple.sandbox.pty\")))\n";
+    p += "(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n";
+    // POSIX semaphores: python multiprocessing's SemLock, and every
+    // ProcessPoolExecutor. named, in a namespace no host secret lives in.
+    p += "(allow ipc-posix-sem)\n";
+    // ps/pgrep/proc_pidinfo on its OWN tree only -- not the host's.
+    p += "(allow process-info* (target same-sandbox))\n";
     p += "(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\"))\n";
     // a process that cannot signal itself cannot abort() or run a timer, and
     // one that cannot signal its own children cannot run `timeout`, a build
@@ -306,6 +400,8 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 continue;
             }
             if (ops.read) emit_rule(out.profile, "allow", "file-read*", g.path);
+            if (ops.read || ops.write || ops.exec)
+                emit_ancestor_metadata(out.profile, g.path);
             if (ops.write) {
                 emit_rule(out.profile, "allow", "file-write*", g.path);
                 any_write = true;
@@ -363,11 +459,33 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         out.profile += "(allow network-bind (regex #\"^/private/tmp/\"))\n";
     }
 
-    if (blanket_ip) {
+    if (d.proxy_listener && d.proxy_port != 0) {
+        // the macOS shape of linux's proxied netns. there is no private
+        // namespace to put the guest in, but seatbelt CAN pin outbound IP to
+        // one loopback port -- measured: 127.0.0.1:PORT connects, every other
+        // loopback port, ::1, the LAN and the internet are EPERM. the
+        // supervisor serves that port and decides what each CONNECT may
+        // reach (no host loopback, no RFC1918, no metadata).
+        //
+        // checked BEFORE blanket_ip on purpose: the embedder spells "proxied
+        // full network" as connect("", 0) + proxied_netns, and reading the
+        // blanket first would hand out (allow network*) -- the very hole
+        // this branch exists to close.
+        //
+        // NO resolver grants: the proxy resolves names on the host side, so
+        // the guest needs no DNS at all, and has no DNS side channel.
+        out.profile += "(deny network*)\n";
+        out.profile += "(allow network-outbound (remote ip \"localhost:" +
+                       std::to_string(d.proxy_port) + "\"))\n";
+        out.allow_network = false;
+        report.record(CapId::net_isolation, Enforcement::strong,
+                      "seatbelt (loopback proxy port only)");
+    } else if (blanket_ip) {
         // the policy allows the network outright. nothing to isolate, and the
         // report says `none` rather than crediting us for a wall we did not
         // build.
         out.profile += "(allow network*)\n";
+        emit_resolver_grants(out.profile);
         out.allow_network = true;
         report.record(CapId::net_isolation, Enforcement::none, "network allowed by policy");
     } else if (d.net.endpoints().empty()) {
@@ -386,6 +504,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // the kernel, and dns can answer differently next time. that gap is
         // exactly why this is partial and not strong.
         out.profile += "(deny network*)\n";
+        emit_resolver_grants(out.profile);
         bool dropped_host_rule = false;
         for (const auto& e : d.net.endpoints()) {
             if (e.ops.is_nothing()) continue;

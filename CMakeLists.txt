@@ -164,6 +164,9 @@ if(CLAYBIN_TESTS)
   # the apply path, which can only be meaningful on a mac: it enters a real
   # seatbelt sandbox and asserts the walls hold. skips itself elsewhere.
   claybin_test(macos_live_check)
+  # every escape route out of seatbelt we have tried, each asserting the
+  # canary did not come back. macOS only; skips itself elsewhere.
+  claybin_test(macos_escape_corpus_test)
   # the windows apply path: a real AppContainer profile, real ACLs, a real
   # confined child. windows-only, because only a windows host can mean it.
   if(WIN32)

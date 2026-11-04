@@ -381,6 +381,47 @@ int main() {
         }
     }
 
+    // -- mach-lookup is an allowlist, never a blanket ---------------------
+    // a bare (allow mach-lookup) hands the guest every launchd service:
+    // pasteboard, keychain, launchd itself. DNS services ride along only
+    // when the policy grants the network.
+    {
+        auto c = macos::compile(shapes::system_ro().seal(), mac);
+        CHECK(c.has_value());
+        if (c) {
+            CHECK(!contains(c->profile, "(allow mach-lookup)"));
+            CHECK(contains(c->profile, "com.apple.system.opendirectoryd.libinfo"));
+            CHECK(!contains(c->profile, "com.apple.pasteboard"));
+            CHECK(!contains(c->profile, "mDNSResponder"));
+            CHECK(contains(c->profile, "(allow pseudo-tty)"));
+            CHECK(contains(c->profile, "(allow process-info* (target same-sandbox))"));
+        }
+        auto n = macos::compile(shapes::system_ro().connect("*", 0).seal(), mac);
+        CHECK(n.has_value());
+        if (n) {
+            CHECK(contains(n->profile, "com.apple.mDNSResponder"));
+            // the keychain daemon: TLS does not need it, so nothing gets it.
+            CHECK(!contains(n->profile, "com.apple.SecurityServer"));
+        }
+    }
+
+    // -- proxied: one loopback port, nothing else, and no DNS --------------
+    // the embedder's "full network" on darwin. connect("", 0) is ALSO set
+    // (that is how the policy says what the proxy may reach), and reading
+    // that blanket first would compile to (allow network*).
+    {
+        auto c = macos::compile(
+            shapes::system_ro().connect("", 0).proxied_netns(49152).seal(), mac);
+        CHECK(c.has_value());
+        if (c) {
+            CHECK(contains(c->profile, "(allow network-outbound (remote ip \"localhost:49152\"))"));
+            CHECK(contains(c->profile, "(deny network*)"));
+            CHECK(!contains(c->profile, "(allow network*)"));
+            CHECK(!contains(c->profile, "mDNSResponder"));
+            CHECK(!c->allow_network);
+        }
+    }
+
     // -- prerequisites can be turned off -----------------------------------
     // an implicit grant nobody can disable is one nobody audits.
     {
