@@ -49,6 +49,7 @@ constexpr std::uint64_t kCloneNewipc = 0x08000000;
 constexpr std::uint64_t kCloneNewuser = 0x10000000;
 constexpr std::uint64_t kCloneNewpid = 0x20000000;
 constexpr std::uint64_t kCloneNewnet = 0x40000000;
+constexpr std::uint64_t kCloneNewcgroup = 0x02000000;
 
 // landlock access bits (abi 1-5)
 constexpr std::uint64_t kLlExecute = 1ull << 0;
@@ -198,6 +199,10 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     if (host.pid_namespaces) unshare_flags |= kCloneNewpid;
     if (host.uts_namespaces) unshare_flags |= kCloneNewuts;
     if (host.ipc_namespaces) unshare_flags |= kCloneNewipc;
+    // the child unshares after spawn has moved it into its cgroup (the gate
+    // pipe), so the namespace root IS the box's group. same userns rule as
+    // the rest: only with a user namespace or as root.
+    if (host.cgroup_namespaces) unshare_flags |= kCloneNewcgroup;
 
     // a policy with no network authority gets an empty network namespace, which
     // is a stronger and cheaper guarantee than filtering socket syscalls.
@@ -243,6 +248,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     } else {
         degrade(CapId::proc_isolation);
         report.record(CapId::proc_isolation, Enforcement::none, "unavailable");
+    }
+
+    // oom_score_adj rides the same write_file op as the id maps, so it lands
+    // in the namespaces phase. raising it needs no capability, and it has to
+    // come before exec so the guest's first allocation is already scored.
+    if (d.oom_score_adj > 0) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%d\n", d.oom_score_adj);
+        b.op(OpCode::write_file,
+             WriteFileOp{b.intern("/proc/self/oom_score_adj"), b.intern(buf)});
     }
 
     if (!wants_net) {
@@ -546,8 +561,12 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                     // that reads exactly like a landlock denial, which is what
                     // makes it worth a comment -- it is not. it reproduces with
                     // zero landlock rules in the plan, and no grant fixes it.
+                    // size=1m: only symlinks, mount points and empty bind
+                    // targets live on this tmpfs. without a size it defaults
+                    // to half of RAM, and /dev/shm used to be a plain dir on
+                    // it, so a guest could fill host memory through it.
                     b.op(OpCode::mount, MountOp{b.intern("tmpfs"), b.intern(dst),
-                                                b.intern("tmpfs"), b.intern("mode=0755"),
+                                                b.intern("tmpfs"), b.intern("mode=0755,size=1m"),
                                                 kMsNosuid | kMsNoexec});
                     for (const char* node : {"null", "zero", "full", "random", "urandom",
                                              "tty"}) {
@@ -586,7 +605,18 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                                  kMsNosuid | kMsNoexec | kClayMountOptional});
                     b.op(OpCode::symlink_at,
                          SymlinkOp{b.intern("pts/ptmx"), b.intern(dst + "/ptmx")});
+                    // /dev/shm is its own tmpfs with a cap, the way docker
+                    // does it (64 MiB unless the mount asks for more). 1777
+                    // because POSIX shm_open needs any user to create there.
                     b.op(OpCode::mkdir_p, MkdirOp{b.intern(dst + "/shm"), 0755, 0});
+                    {
+                        const std::uint64_t shm = m.size ? m.size : (64ull << 20);
+                        const std::string opts = "mode=1777,size=" + std::to_string(shm);
+                        b.op(OpCode::mount,
+                             MountOp{b.intern("tmpfs"), b.intern(dst + "/shm"),
+                                     b.intern("tmpfs"), b.intern(opts),
+                                     kMsNosuid | kMsNodev | kMsNoexec});
+                    }
 
                     report.record(CapId::device_isolation, Enforcement::strong, "dev allowlist");
                     break;

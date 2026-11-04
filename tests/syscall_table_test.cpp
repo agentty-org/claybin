@@ -160,6 +160,26 @@ constexpr Named kExpected[] = {
     {"delete_module", SYS_delete_module},
     {"kexec_load", SYS_kexec_load},
     {"reboot", SYS_reboot},
+    {"finit_module", SYS_finit_module},
+    {"kexec_file_load", SYS_kexec_file_load},
+    {"open_tree", SYS_open_tree},
+    {"move_mount", SYS_move_mount},
+    {"fsopen", SYS_fsopen},
+    {"fsconfig", SYS_fsconfig},
+    {"fsmount", SYS_fsmount},
+    {"fspick", SYS_fspick},
+    {"mount_setattr", SYS_mount_setattr},
+    // allowed with argument rules, or read-only
+    {"prctl", SYS_prctl},
+    {"personality", SYS_personality},
+    {"getxattr", SYS_getxattr},
+    {"lgetxattr", SYS_lgetxattr},
+    {"fgetxattr", SYS_fgetxattr},
+    {"listxattr", SYS_listxattr},
+    {"llistxattr", SYS_llistxattr},
+    {"flistxattr", SYS_flistxattr},
+    {"setxattr", SYS_setxattr},
+    {"removexattr", SYS_removexattr},
 
     // processes
     {"clone", SYS_clone},
@@ -287,7 +307,8 @@ int main() {
     static constexpr const char* kMustKill[] = {
         "ptrace", "mount", "umount2", "pivot_root", "chroot", "unshare", "setns",
         "bpf", "perf_event_open", "init_module", "delete_module", "kexec_load",
-        "reboot",
+        "reboot", "finit_module", "kexec_file_load", "open_tree", "move_mount",
+        "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr",
     };
     for (const char* name : kMustKill) {
         long nr = nr_of(name);
@@ -311,7 +332,7 @@ int main() {
         "read", "write", "close", "mmap", "mprotect", "munmap", "brk",
         "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "openat", "newfstatat",
         "exit_group", "futex", "set_tid_address", "set_robust_list", "getrandom",
-        "arch_prctl", "ioctl",
+        "arch_prctl", "ioctl", "prctl", "personality",
     };
     for (const char* name : kMustAllow) {
         long nr = nr_of(name);
@@ -375,6 +396,42 @@ int main() {
     CHECK(!permitted(profiles::base(), SYS_mlockall));
     CHECK_EQ(profiles::base().action_for(SYS_mlockall), SysAction::errno_);
     CHECK_EQ(profiles::base().errno_for(SYS_mlockall), std::uint16_t{1});
+
+    // xattr reads are allowed (ls probes them per file); writes are not.
+    for (long nr : {(long)SYS_getxattr, (long)SYS_lgetxattr, (long)SYS_fgetxattr,
+                    (long)SYS_listxattr, (long)SYS_llistxattr, (long)SYS_flistxattr})
+        CHECK(permitted(profiles::with_filesystem(), (SysNr)nr));
+    CHECK(!permitted(profiles::compiler_with_network(), SYS_setxattr));
+    CHECK(!permitted(profiles::compiler_with_network(), SYS_removexattr));
+
+    // prctl and personality are allowed but narrowed by option. the set is
+    // the whole point, so pin both ends of it.
+    {
+        const auto p = profiles::base();
+        auto allow_set = [&](long nr) -> const std::vector<std::uint32_t>* {
+            for (const auto& s : p.arg_allow_sets())
+                if (s.nr == (SysNr)nr && s.arg_index == 0) return &s.values;
+            return nullptr;
+        };
+        auto has = [](const std::vector<std::uint32_t>* v, std::uint32_t x) {
+            return v && std::binary_search(v->begin(), v->end(), x);
+        };
+        const auto* pr = allow_set(SYS_prctl);
+        CHECK(pr != nullptr);
+        CHECK(has(pr, 15));          // PR_SET_NAME
+        CHECK(has(pr, 1));           // PR_SET_PDEATHSIG
+        CHECK(!has(pr, 22));         // PR_SET_SECCOMP
+        CHECK(!has(pr, 35));         // PR_SET_MM
+        CHECK(!has(pr, 47));         // PR_CAP_AMBIENT
+        CHECK(!has(pr, 8));          // PR_SET_KEEPCAPS
+        CHECK(!has(pr, 0x59616d61)); // PR_SET_PTRACER
+        const auto* pe = allow_set(SYS_personality);
+        CHECK(pe != nullptr);
+        CHECK(has(pe, 0xffffffffu));
+        CHECK(has(pe, 0));
+        CHECK(!has(pe, 0x0040000));  // ADDR_NO_RANDOMIZE
+        CHECK(!has(pe, 0x0400000));  // READ_IMPLIES_EXEC
+    }
 
     // -- the aarch64 tables, checked on an x86_64 host ---------------------
     //
@@ -448,7 +505,10 @@ int main() {
             {"pivot_root", 41},    {"chroot", 51},        {"unshare", 97},
             {"setns", 268},        {"bpf", 280},          {"perf_event_open", 241},
             {"init_module", 105},  {"delete_module", 106}, {"finit_module", 273},
-            {"kexec_load", 104},   {"reboot", 142},
+            {"kexec_load", 104},   {"reboot", 142},      {"kexec_file_load", 294},
+            {"open_tree", 428},   {"move_mount", 429},  {"fsopen", 430},
+            {"fsconfig", 431},    {"fsmount", 432},     {"fspick", 433},
+            {"mount_setattr", 442},
         };
         for (const auto& e : kMustKillArm) {
             if (arm_base.action_for(static_cast<SysNr>(e.nr)) != SysAction::kill_process) {

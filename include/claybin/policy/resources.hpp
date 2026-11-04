@@ -214,8 +214,8 @@ class ResourceLimits {
     Bytes io_read_bps{};
     Bytes io_write_bps{};
     // note: unlimited here so `everything()` is a genuine top element. "no core
-    // dumps" is a *profile* decision, not a lattice one -- a fresh Draft starts
-    // at nothing(), which already pins this to 0.
+    // dumps" is a policy default, not a lattice one: Policy<Draft>'s
+    // constructor sets it to 0 (core_dumps(true) undoes it).
     Bytes core_size{};
 
     static ResourceLimits nothing() {

@@ -94,6 +94,13 @@ struct PolicyData {
     // than surviving as a stray process nobody is watching.
     bool die_with_parent{false};
 
+    // /proc/self/oom_score_adj for the guest. positive makes the kernel's OOM
+    // killer pick the guest before the host's own processes, which is the
+    // right order when a box with no memory cap runs a build that blows up.
+    // raising it needs no privilege; lowering it does, so a guest can't undo
+    // it. 0 leaves the inherited value alone.
+    std::int32_t oom_score_adj{0};
+
     // close every inherited descriptor above stderr before the guest runs.
     //
     // ON BY DEFAULT, and that is a deliberate difference from bubblewrap. an
@@ -153,6 +160,8 @@ struct PolicyData {
         // composing policies must not be able to turn a protection off.
         r.new_session = new_session || o.new_session;
         r.die_with_parent = die_with_parent || o.die_with_parent;
+        // "kill me first" is hardening too: the higher value wins.
+        r.oom_score_adj = oom_score_adj > o.oom_score_adj ? oom_score_adj : o.oom_score_adj;
         // hardening: whichever side wants it, wins.
         r.close_inherited_fds = close_inherited_fds || o.close_inherited_fds;
         // capabilities are authority, so this is a real meet: a capability
@@ -190,7 +199,15 @@ class Policy<Draft> {
     // RLIMIT_AS=0 makes execve fail with EACCES before the program ever runs.
     // bottom is the right identity for permissions and the wrong default for
     // ceilings, so a draft starts unlimited and the caller tightens explicitly.
-    Policy() { data_.resources = ResourceLimits::everything(); }
+    //
+    // core size is the one exception: 0. a guest that crashes (a seccomp
+    // SIGSYS kill included) would otherwise dump its memory to the host's
+    // core handler, which on systemd-coredump means the host journal.
+    // core_dumps(true) opts back in.
+    Policy() {
+        data_.resources = ResourceLimits::everything();
+        data_.resources.core_size = Bytes{0};
+    }
 
     Policy(const Policy&) = default;
     Policy& operator=(const Policy&) = default;
@@ -351,6 +368,11 @@ class Policy<Draft> {
     }
 
     // -- resources ----------------------------------------------------------
+    // let the guest write core files. off by default: see the constructor.
+    Policy&& core_dumps(bool on) && {
+        data_.resources.core_size = on ? Bytes{} : Bytes{0};
+        return std::move(*this);
+    }
     Policy&& memory(Bytes b) && {
         data_.resources.memory = b;
         return std::move(*this);
@@ -426,6 +448,11 @@ class Policy<Draft> {
     // thing that was supposed to be watching it.
     Policy&& die_with_parent() && {
         data_.die_with_parent = true;
+        return std::move(*this);
+    }
+    // range -1000..1000; see PolicyData::oom_score_adj.
+    Policy&& oom_score_adj(std::int32_t v) && {
+        data_.oom_score_adj = v < -1000 ? -1000 : v > 1000 ? 1000 : v;
         return std::move(*this);
     }
     // let the guest inherit the caller's open descriptors.

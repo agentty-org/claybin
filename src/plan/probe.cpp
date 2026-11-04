@@ -166,6 +166,7 @@ HostCapabilities probe_host() {
     h.net_namespaces = ns_creatable && path_exists("/proc/self/ns/net");
     h.uts_namespaces = ns_creatable && path_exists("/proc/self/ns/uts");
     h.ipc_namespaces = ns_creatable && path_exists("/proc/self/ns/ipc");
+    h.cgroup_namespaces = ns_creatable && path_exists("/proc/self/ns/cgroup");
     h.seccomp = probe_seccomp();
     h.seccomp_user_notif = h.seccomp && probe_user_notif();
     h.kvm = probe_kvm();

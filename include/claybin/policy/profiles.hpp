@@ -40,6 +40,25 @@ namespace clay::CLAY_PROFILES_NAMESPACE {
 #define CLAY_PROFILES_AARCH64 1
 #endif
 
+// prctl options a guest may use: each acts only on the caller's own process.
+// the values are the same on every arch (linux/prctl.h).
+inline constexpr std::uint32_t kPrctlAllowed[] = {
+    1, 2,        // PR_SET/GET_PDEATHSIG
+    3, 4,        // PR_GET/SET_DUMPABLE (can only lower it once nnp is set)
+    15, 16,      // PR_SET/GET_NAME
+    21,          // PR_GET_SECCOMP
+    23,          // PR_CAPBSET_READ
+    27,          // PR_GET_SECUREBITS
+    29, 30,      // PR_SET/GET_TIMERSLACK
+    36, 37,      // PR_SET/GET_CHILD_SUBREAPER
+    38, 39,      // PR_SET/GET_NO_NEW_PRIVS (setting it only narrows)
+    40,          // PR_GET_TID_ADDRESS
+    41, 42,      // PR_SET/GET_THP_DISABLE
+    0x53564d41,  // PR_SET_VMA (anon mapping names; glibc 2.40+ calls it)
+};
+// personality(0xffffffff) only reads the current value; 0 is PER_LINUX.
+inline constexpr std::uint32_t kPersonalityAllowed[] = {0u, 0xffffffffu};
+
 #if defined(CLAY_PROFILES_X86_64)
 
 // the bare minimum for a dynamically linked program to start, run, and exit.
@@ -140,6 +159,22 @@ inline SyscallPolicy base() {
     // which is exactly the path we can filter. EPERM here would make
     // pthread_create fail instead of fall back.
     p.deny(435 /* clone3 */, 38 /* ENOSYS */);
+
+    // prctl, but only options that act on the caller's own process. without
+    // it Chromium, Electron and Python multiprocessing fail at startup
+    // (PR_SET_NAME, PR_SET_PDEATHSIG). PR_SET_SECCOMP, PR_SET_MM,
+    // PR_SET_PTRACER, PR_CAP_AMBIENT and PR_SET_KEEPCAPS aren't listed, so
+    // they get EPERM.
+    p.allow(157 /* prctl */);
+    p.allow_arg32_only(157, 0 /* option */, std::span<const std::uint32_t>{kPrctlAllowed},
+                       SysAction::errno_, 1 /* EPERM */);
+
+    // personality: query (0xffffffff) and PER_LINUX only. ADDR_NO_RANDOMIZE
+    // (`setarch -R`) and READ_IMPLIES_EXEC would weaken the guest's own
+    // hardening.
+    p.allow(135 /* personality */);
+    p.allow_arg32_only(135, 0, std::span<const std::uint32_t>{kPersonalityAllowed},
+                       SysAction::errno_, 1);
 
     // process-group and session calls. these are NOT privileges -- they only
     // touch the caller's own group -- but every shell calls them during startup
@@ -298,7 +333,13 @@ inline SyscallPolicy base() {
                      155u /* pivot_root */, 161u /* chroot */, 272u /* unshare */,
                      308u /* setns */, 321u /* bpf */, 298u /* perf_event_open */,
                      175u /* init_module */, 176u /* delete_module */,
-                     246u /* kexec_load */, 169u /* reboot */})
+                     313u /* finit_module */, 246u /* kexec_load */,
+                     320u /* kexec_file_load */, 169u /* reboot */,
+                     // the new mount API. each is as much an escape primitive
+                     // as mount(2), and aarch64 already killed finit_module.
+                     428u /* open_tree */, 429u /* move_mount */, 430u /* fsopen */,
+                     431u /* fsconfig */, 432u /* fsmount */, 433u /* fspick */,
+                     442u /* mount_setattr */})
         p.kill(nr);
 
     // ---- ioctl, restricted by ARGUMENT to an allow-list -------------------
@@ -442,6 +483,13 @@ inline SyscallPolicy with_filesystem() {
                      266u /* symlinkat */, 269u /* faccessat */, 280u /* utimensat */,
                      285u /* fallocate */, 316u /* renameat2 */, 332u /* statx */,
                      439u /* faccessat2 */})
+        p.allow(nr);
+    // read-only xattrs. coreutils `ls` and `cp -a` probe them per file
+    // (security.selinux, system.posix_acl_access) and print an error on
+    // EPERM. reading metadata grants nothing the mount tree and landlock
+    // don't already decide; the set*/remove* calls stay denied.
+    for (SysNr nr : {191u /* getxattr */, 192u /* lgetxattr */, 193u /* fgetxattr */,
+                     194u /* listxattr */, 195u /* llistxattr */, 196u /* flistxattr */})
         p.allow(nr);
     return p;
 }
@@ -625,13 +673,25 @@ inline SyscallPolicy base() {
     // we CAN filter, where EPERM would break pthread_create.
     p.deny(435 /* clone3 */, 38 /* ENOSYS */);
 
+    // same prctl and personality rules as x86_64; see there.
+    p.allow(167 /* prctl */);
+    p.allow_arg32_only(167, 0, std::span<const std::uint32_t>{kPrctlAllowed},
+                       SysAction::errno_, 1);
+    p.allow(92 /* personality */);
+    p.allow_arg32_only(92, 0, std::span<const std::uint32_t>{kPersonalityAllowed},
+                       SysAction::errno_, 1);
+
     // outright denials, killed rather than errno'd: nothing legitimate calls
     // these inside a sandbox, so a kill is an unmistakable audit signal.
     for (SysNr nr : {117u /* ptrace */, 40u /* mount */, 39u /* umount2 */,
                      41u /* pivot_root */, 51u /* chroot */, 97u /* unshare */,
                      268u /* setns */, 280u /* bpf */, 241u /* perf_event_open */,
                      105u /* init_module */, 106u /* delete_module */,
-                     273u /* finit_module */, 104u /* kexec_load */, 142u /* reboot */})
+                     273u /* finit_module */, 104u /* kexec_load */, 142u /* reboot */,
+                     294u /* kexec_file_load */,
+                     428u /* open_tree */, 429u /* move_mount */, 430u /* fsopen */,
+                     431u /* fsconfig */, 432u /* fsmount */, 433u /* fspick */,
+                     442u /* mount_setattr */})
         p.kill(nr);
 
     // ioctl by allow-list, not deny-list -- see the x86_64 block for why. the
@@ -717,6 +777,13 @@ inline constexpr SysNr kFsSyscalls[] = {
     276,  // renameat2
     291,  // statx
     439,  // faccessat2
+    // read-only xattrs (see x86_64)
+    8,    // getxattr
+    9,    // lgetxattr
+    10,   // fgetxattr
+    11,   // listxattr
+    12,   // llistxattr
+    13,   // flistxattr
 };
 
 inline SyscallPolicy with_filesystem() {

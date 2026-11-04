@@ -245,6 +245,73 @@ int main() {
         CHECK(checked);
     }
 
+    // -- audit fixes: shm cap, no core dumps, oom score, cgroup ns ---------
+    {
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .dev_fs("/dev")
+                       .oom_score_adj(500)
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto c = compile(pol, HostCapabilities::modern_linux());
+        CHECK(c.has_value());
+        bool shm_capped = false, dev_capped = false, core0 = false, oom = false,
+             cgroupns = false;
+        c->plan.for_each([&](OpCode code, std::span<const std::byte> payload) {
+            if (code == OpCode::mount) {
+                MountOp op{};
+                Plan::decode(payload, op);
+                const char* tgt = c->plan.cstr(op.target);
+                const char* dat = op.data.len ? c->plan.cstr(op.data) : "";
+                const std::string_view t{tgt ? tgt : ""}, o{dat ? dat : ""};
+                if (t.ends_with("/dev/shm") && o.find("size=67108864") != o.npos)
+                    shm_capped = true;
+                if (t.ends_with("/dev") && o.find("size=1m") != o.npos) dev_capped = true;
+            } else if (code == OpCode::set_rlimit) {
+                SetRlimitOp op{};
+                Plan::decode(payload, op);
+                if (op.resource == 4 /* RLIMIT_CORE */ && op.soft == 0 && op.hard == 0)
+                    core0 = true;
+            } else if (code == OpCode::write_file) {
+                WriteFileOp op{};
+                Plan::decode(payload, op);
+                const char* p = c->plan.cstr(op.path);
+                const char* v = c->plan.cstr(op.content);
+                if (p && v && std::string_view{p} == "/proc/self/oom_score_adj" &&
+                    std::string_view{v} == "500\n")
+                    oom = true;
+            } else if (code == OpCode::unshare) {
+                UnshareOp op{};
+                Plan::decode(payload, op);
+                cgroupns = (op.flags & 0x02000000) != 0;
+            }
+            return true;
+        });
+        CHECK(shm_capped);
+        CHECK(dev_capped);
+        CHECK(core0);
+        CHECK(oom);
+        CHECK(cgroupns);
+
+        // core dumps come back only when asked for.
+        auto with_core = Policy<Draft>{}.read("/usr").core_dumps(true).seal();
+        CHECK(with_core.data().resources.core_size.is_unlimited());
+
+        // no cgroup ns on a host that can't create one.
+        HostCapabilities no_cg = HostCapabilities::modern_linux();
+        no_cg.cgroup_namespaces = false;
+        auto c2 = compile(pol, no_cg);
+        CHECK(c2.has_value());
+        c2->plan.for_each([&](OpCode code, std::span<const std::byte> payload) {
+            if (code == OpCode::unshare) {
+                UnshareOp op{};
+                Plan::decode(payload, op);
+                CHECK((op.flags & 0x02000000) == 0);
+            }
+            return true;
+        });
+    }
+
     // -- hardened refuses to downgrade ------------------------------------
     {
         HostCapabilities weak;
