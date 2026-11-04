@@ -168,6 +168,7 @@ resource limits, or talk to unintended hosts.
 kernel exploits are explicitly **out of scope** for the process backend. that is
 what the microvm backend is for, and the guarantee report says
 `HostKernelIsolation: none` on the process backend so nobody gets confused.
+see [microvm.md](microvm.md) for the plan.
 
 ## non-goals
 
