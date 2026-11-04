@@ -375,6 +375,38 @@ int main() {
         }
     }
 
+    // -- W^X: the arg rule is partial, MDWE is the real wall ---------------
+    {
+        const auto hostcaps = HostCapabilities::modern_linux();
+        // off by default: MDWE breaks every JIT (node/V8 will not start), and
+        // a build sandbox has to run a normal toolchain.
+        auto lax = Policy<Draft>{}
+                       .read("/usr")
+                       .syscall_profile(profiles::base())
+                       .seal();
+        CHECK(!lax.data().deny_write_execute);
+        auto cl = compile(lax, hostcaps);
+        CHECK(cl.has_value());
+        if (cl) CHECK(!cl->plan.has(OpCode::memory_deny_write_execute));
+
+        // asked for: the op is there, and it sits in privdrop -- with
+        // no_new_privs, before the guest's own code runs.
+        auto strict = Policy<Draft>{}
+                          .read("/usr")
+                          .deny_write_execute()
+                          .syscall_profile(profiles::base())
+                          .seal();
+        CHECK(strict.data().deny_write_execute);
+        auto cs = compile(strict, hostcaps);
+        CHECK(cs.has_value());
+        if (cs) {
+            CHECK(cs->plan.has(OpCode::memory_deny_write_execute));
+            CHECK(phase_of(OpCode::memory_deny_write_execute) == Phase::privdrop);
+        }
+        // hardening composes upward: either side asking for it wins.
+        CHECK(lax.meet(strict).data().deny_write_execute);
+    }
+
     // -- hardened refuses to downgrade ------------------------------------
     {
         HostCapabilities weak;

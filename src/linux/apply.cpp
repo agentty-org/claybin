@@ -1441,6 +1441,22 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                 }
                 return true;
             }
+            case OpCode::memory_deny_write_execute: {
+                // PR_SET_MDWE=65, PR_MDWE_REFUSE_EXEC_GAIN=bit 0. named rather
+                // than included: <sys/prctl.h> on an older build host has
+                // neither, and these are stable ABI.
+                constexpr long kPrSetMdwe = 65;
+                constexpr long kRefuseExecGain = 1;
+                if (sys(SYS_prctl, kPrSetMdwe, kRefuseExecGain, 0, 0, 0) < 0) {
+                    // EINVAL on a kernel below 6.3, which simply does not have
+                    // it. the seccomp arg rule is still installed, so this is
+                    // a weaker wall rather than no wall -- compile() records
+                    // the difference, so do not fail the spawn over it.
+                    if (errno != EINVAL && errno != ENOSYS)
+                        return die(Errc::permission_denied, "mdwe", errno);
+                }
+                return true;
+            }
             case OpCode::set_ids: {
                 SetIdsOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "setids", 0);

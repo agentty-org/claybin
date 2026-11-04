@@ -923,6 +923,21 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         }
 
         b.op(OpCode::no_new_privs, NoNewPrivsOp{0});
+        // and MDWE, which is the real W^X wall. the seccomp rule below denies
+        // mmap/mprotect with PROT_WRITE|PROT_EXEC in ONE call; MDWE denies
+        // gaining exec on writable memory at all, which is the two-call
+        // sequence the arg filter cannot see. emitted whenever the policy's
+        // syscall profile carries the arg rule, so the two always agree about
+        // what the guest was promised.
+        if (d.deny_write_execute) {
+            b.op(OpCode::memory_deny_write_execute, NoNewPrivsOp{0});
+            report.record(CapId::memory_wx, Enforcement::strong, "MDWE");
+        } else {
+            // the argument rule is still installed by the profile, and it is
+            // genuinely weaker: it denies one call shape, not the transition.
+            report.record(CapId::memory_wx, Enforcement::partial,
+                          "seccomp arg rule (mmap W->mprotect X not covered)");
+        }
         // the bounding set: everything NOT in keep_caps is dropped, so a caller
         // who says nothing gets the empty set. forbidden_caps() is masked out
         // even if a caller managed to ask, because a sandbox holding

@@ -116,6 +116,19 @@ enum class OpCode : std::uint16_t {
     landlock_enforce,
     drop_caps,
     no_new_privs,
+    // PR_SET_MDWE: the kernel refuses to let this process GAIN execute on
+    // writable memory, for its whole life.
+    //
+    // the seccomp W^X rule checks mmap/mprotect arguments one call at a time,
+    // so it stops `mmap(PROT_WRITE|PROT_EXEC)` and misses the sequence that
+    // every real JIT-shellcode path actually uses: map it writable, write to
+    // it, then mprotect it executable. two individually innocent calls.
+    // measured: that sequence succeeded under the arg filter alone.
+    //
+    // MDWE is a process property rather than a syscall predicate, so it sees
+    // the transition instead of the call. it is strictly stronger and costs
+    // one prctl.
+    memory_deny_write_execute,
     seccomp_install,
     // bring `lo` up inside a fresh network namespace, and (when the policy
     // asked for proxied network) open a listening socket on 127.0.0.1 there.
@@ -172,6 +185,9 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::landlock_enforce: return Phase::landlock;
         case OpCode::drop_caps:
         case OpCode::no_new_privs: return Phase::privdrop;
+        // with nnp: both are irreversible process properties, and MDWE must be
+        // set before the guest's own code runs.
+        case OpCode::memory_deny_write_execute: return Phase::privdrop;
         case OpCode::seccomp_install: return Phase::seccomp;
     }
     return Phase::seccomp;
@@ -189,6 +205,7 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::symlink_at: return "symlink";
         case OpCode::write_fd_content: return "write_fd";
         case OpCode::loopback_up: return "loopback_up";
+        case OpCode::memory_deny_write_execute: return "mdwe";
         case OpCode::pivot_root: return "pivot_root";
         case OpCode::pivot_into_newroot: return "pivot_newroot";
         case OpCode::umount: return "umount";

@@ -101,6 +101,23 @@ struct PolicyData {
     // it. 0 leaves the inherited value alone.
     std::int32_t oom_score_adj{0};
 
+    // W^X as a process property: PR_SET_MDWE, so the kernel refuses to let the
+    // guest gain execute on writable memory at all.
+    //
+    // OFF by default, and the reason is measured rather than theoretical: this
+    // breaks every JIT. node/V8 dies on startup under MDWE (verified on the
+    // host, not just in a box), and so would any java, .NET or luajit guest.
+    // python is fine. a build sandbox that cannot run node is not a build
+    // sandbox, so this is the one hardening flag that has to be asked for.
+    //
+    // separate from the syscall profile's mmap/mprotect argument rule because
+    // the two catch different things: the arg rule sees one call
+    // (`mmap(PROT_WRITE|PROT_EXEC)`), MDWE sees the transition
+    // (`mmap(PROT_WRITE)` then `mprotect(PROT_EXEC)`), which is what real
+    // shellcode uses and what the arg rule provably misses. so the arg rule
+    // alone is a partial wall, and saying so is the point of the report.
+    bool deny_write_execute{false};
+
     // put the guest in its OWN network namespace even though it has network
     // authority, and bring loopback up there.
     //
@@ -193,6 +210,8 @@ struct PolicyData {
         r.die_with_parent = die_with_parent || o.die_with_parent;
         // "kill me first" is hardening too: the higher value wins.
         r.oom_score_adj = oom_score_adj > o.oom_score_adj ? oom_score_adj : o.oom_score_adj;
+        // hardening: either side asking for it wins.
+        r.deny_write_execute = deny_write_execute || o.deny_write_execute;
         // another hardening flag: either side asking for the private namespace
         // gets it.
         r.netns_with_loopback = netns_with_loopback || o.netns_with_loopback;
@@ -490,6 +509,13 @@ class Policy<Draft> {
     // range -1000..1000; see PolicyData::oom_score_adj.
     Policy&& oom_score_adj(std::int32_t v) && {
         data_.oom_score_adj = v < -1000 ? -1000 : v > 1000 ? 1000 : v;
+        return std::move(*this);
+    }
+    // refuse to let the guest gain execute on writable memory (PR_SET_MDWE).
+    // breaks every JIT -- node/V8 will not start -- so it is opt-in. see
+    // PolicyData::deny_write_execute.
+    Policy&& deny_write_execute() && {
+        data_.deny_write_execute = true;
         return std::move(*this);
     }
     // an own network namespace with loopback up, even WITH net authority.

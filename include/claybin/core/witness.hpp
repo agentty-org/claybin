@@ -49,6 +49,16 @@ struct PrivilegeDrop {
 struct DeviceIsolation {
     static constexpr const char* name = "device.isolation";
 };
+// can the guest get executable memory it also wrote?
+//
+// its own row because the two mechanisms are not the same wall: the seccomp
+// argument rule denies mmap/mprotect with PROT_WRITE|PROT_EXEC in one call
+// (`partial` -- the mmap(W) then mprotect(X) sequence walks past it), while
+// PR_SET_MDWE denies gaining exec on writable memory at all (`strong`).
+// reporting one number for both would hide exactly the gap that matters.
+struct MemoryWriteExecute {
+    static constexpr const char* name = "memory.wx";
+};
 struct HostKernelIsolation {
     static constexpr const char* name = "host.kernel_isolation";
 };
@@ -66,6 +76,7 @@ enum class CapId : std::uint8_t {
     pid_limit,
     privilege_drop,
     device_isolation,
+    memory_wx,
     host_kernel_isolation,
     count_,
 };
@@ -86,6 +97,7 @@ template <> struct cap_id<cap::CpuLimit>            { static constexpr CapId val
 template <> struct cap_id<cap::PidLimit>            { static constexpr CapId value = CapId::pid_limit; };
 template <> struct cap_id<cap::PrivilegeDrop>       { static constexpr CapId value = CapId::privilege_drop; };
 template <> struct cap_id<cap::DeviceIsolation>     { static constexpr CapId value = CapId::device_isolation; };
+template <> struct cap_id<cap::MemoryWriteExecute>  { static constexpr CapId value = CapId::memory_wx; };
 template <> struct cap_id<cap::HostKernelIsolation> { static constexpr CapId value = CapId::host_kernel_isolation; };
 // clang-format on
 
@@ -102,6 +114,7 @@ constexpr const char* cap_name(CapId id) {
         case CapId::pid_limit: return "resource.pids";
         case CapId::privilege_drop: return "privilege.drop";
         case CapId::device_isolation: return "device.isolation";
+        case CapId::memory_wx: return "memory.wx";
         case CapId::host_kernel_isolation: return "host.kernel_isolation";
         case CapId::count_: break;
     }
