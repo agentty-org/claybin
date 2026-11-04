@@ -423,6 +423,10 @@ inline int dev_mem_read() { return read_path("/dev/mem"); }
 inline int dev_kmsg_read() { return read_path("/dev/kmsg"); }
 inline int dev_kcore_read() { return read_path("/proc/kcore"); }
 inline int sysrq_trigger() { return write_path("/proc/sysrq-trigger"); }
+// /proc/sys is visible (V8 reads it) but must stay read-only.
+inline int sysctl_core_pattern() { return write_path("/proc/sys/kernel/core_pattern"); }
+inline int sysctl_drop_caches() { return write_path("/proc/sys/vm/drop_caches"); }
+inline int sysctl_hostname() { return write_path("/proc/sys/kernel/hostname"); }
 
 // ---------------------------------------------------------------------------
 // information disclosure: things that leak the host even if we cannot touch it
@@ -763,6 +767,9 @@ inline const Attack* table(std::size_t& count) {
         {"dev.kmsg", dev_kmsg_read, false},
         {"dev.kcore", dev_kcore_read, false},
         {"dev.sysrq", sysrq_trigger, false},
+        {"sysctl.core_pattern", sysctl_core_pattern, false},
+        {"sysctl.drop_caches", sysctl_drop_caches, false},
+        {"sysctl.hostname", sysctl_hostname, false},
 
         // disclosure
         {"info.host_cmdline", read_host_cmdline, false},
