@@ -112,11 +112,13 @@ std::uint64_t to_landlock(FileRights r, std::uint32_t abi) {
     return out;
 }
 
-// landlock network access bits (abi 4+). these mediate TCP bind and connect by
-// PORT, which is a genuine second wall on top of the network namespace: a netns
-// is all-or-nothing, landlock net is per-port.
+// landlock network access bits. TCP bind/connect by PORT arrived in abi 4,
+// UDP bind/connect-send in abi 10. per-port is a genuine second wall on top
+// of the network namespace: a netns is all-or-nothing, landlock net is not.
 constexpr std::uint64_t kLlBindTcp = 1ull << 0;
 constexpr std::uint64_t kLlConnectTcp = 1ull << 1;
+constexpr std::uint64_t kLlBindUdp = 1ull << 2;        // abi 10
+constexpr std::uint64_t kLlConnectSendUdp = 1ull << 3; // abi 10
 
 // the full set of rights a ruleset governs, for this abi. anything not in here
 // is simply not mediated by landlock, so the report must not claim it is.
@@ -1007,7 +1009,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                            [](const NetEndpoint& e) { return e.port != 0; });
         std::uint64_t handled_net = 0;
         const bool want_net_rules = host.landlock_abi >= 4 && net_by_port;
-        if (want_net_rules) handled_net = kLlBindTcp | kLlConnectTcp;
+        if (want_net_rules) {
+            handled_net = kLlBindTcp | kLlConnectTcp;
+            // UDP, where the kernel knows it. WITHOUT this the port
+            // allowlist covers TCP only, and a guest under it still sends a
+            // datagram anywhere -- measured: `NetMode::Ports` with 443
+            // allowed reached both 1.1.1.1:53 and the LAN over UDP. A port
+            // allowlist that one protocol walks past is not an allowlist.
+            if (host.landlock_abi >= 10)
+                handled_net |= kLlBindUdp | kLlConnectSendUdp;
+        }
 
         // when a tree was built, landlock rules apply to the SANDBOX paths, not
         // the host ones, because that is what exists after the pivot. the mount
@@ -1086,6 +1097,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // enforced.
         bool net_fully_enforced = want_net_rules;
         if (want_net_rules) {
+            // UDP needs one extra grant that TCP does not, and the kernel
+            // documents it: sending a datagram AUTO-BINDS the socket to an
+            // ephemeral local port, so handling BIND_UDP without allowing
+            // that bind denies every send -- including on a port the caller
+            // explicitly allowed. Granting BIND_UDP on port 0 means "any
+            // ephemeral port", which is the source side, not a destination.
+            // Found by a test: allowing 53 still broke DNS until this went in.
+            if (handled_net & kLlBindUdp)
+                b.op(OpCode::landlock_net_rule,
+                     LandlockNetRuleOp{kLlBindUdp, 0, {}});
             for (const auto& e : d.net.endpoints()) {
                 if (e.port == 0) {
                     net_fully_enforced = false;
@@ -1094,6 +1115,15 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 std::uint64_t allowed = 0;
                 if (e.ops.any(kNetConnect)) allowed |= kLlConnectTcp;
                 if (e.ops.any(kNetBind)) allowed |= kLlBindTcp;
+                // The same grant covers UDP on that port where the kernel
+                // models it. A caller asking for "port 443" means the port,
+                // not the protocol -- and handling the UDP bits without
+                // granting them would deny every datagram, which breaks DNS
+                // on a policy that allowed port 53.
+                if (handled_net & kLlConnectSendUdp) {
+                    if (e.ops.any(kNetConnect)) allowed |= kLlConnectSendUdp;
+                    if (e.ops.any(kNetBind)) allowed |= kLlBindUdp;
+                }
                 if (allowed == 0) continue;
                 b.op(OpCode::landlock_net_rule,
                      LandlockNetRuleOp{allowed, e.port, {}});

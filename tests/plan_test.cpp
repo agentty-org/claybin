@@ -375,6 +375,52 @@ int main() {
         }
     }
 
+    // -- landlock abi gating: UDP port rules (abi 10) ----------------------
+    //
+    // A port allowlist that covers TCP only is not an allowlist: measured in
+    // a real box, `NetMode::Ports` with 443 allowed still reached 1.1.1.1:53
+    // AND the LAN over UDP. abi 10 is the first kernel that can say no.
+    {
+        constexpr std::uint64_t kBindUdp = 1ull << 2;
+        constexpr std::uint64_t kConnectSendUdp = 1ull << 3;
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .connect("", 443)
+                       .syscall_profile(profiles::with_network())
+                       .seal();
+        struct Seen { std::uint64_t any = 0; bool ephemeral_bind = false; };
+        auto net_rules = [&](std::uint32_t abi) -> Seen {
+            HostCapabilities h = HostCapabilities::modern_linux();
+            h.landlock_abi = abi;
+            auto c = compile(pol, h);
+            CHECK(c.has_value());
+            Seen s;
+            if (c)
+                c->plan.for_each([&](OpCode code, std::span<const std::byte> payload) {
+                    if (code == OpCode::landlock_net_rule) {
+                        LandlockNetRuleOp op{};
+                        Plan::decode(payload, op);
+                        s.any |= op.allowed;
+                        if (op.port == 0 && op.allowed == kBindUdp) s.ephemeral_bind = true;
+                    }
+                    return true;
+                });
+            return s;
+        };
+        // abi 4..9 know TCP only. Asking for the UDP bits there makes
+        // create_ruleset fail, which would leave the guest UNCONFINED.
+        CHECK((net_rules(4).any & (kBindUdp | kConnectSendUdp)) == 0);
+        CHECK((net_rules(9).any & (kBindUdp | kConnectSendUdp)) == 0);
+        CHECK(!net_rules(9).ephemeral_bind);
+        // abi 10: the allowed port carries UDP too.
+        const auto ten = net_rules(10);
+        CHECK((ten.any & kConnectSendUdp) != 0);
+        // And the source-side grant, without which every send is denied --
+        // sending auto-binds an ephemeral local port, so handling BIND_UDP
+        // and not allowing that bind breaks DNS on a policy that allowed 53.
+        CHECK(ten.ephemeral_bind);
+    }
+
     // -- landlock abi gating: pathname unix sockets (abi 9) ----------------
     //
     // Measured on a real abi-10 host before this went in: without
