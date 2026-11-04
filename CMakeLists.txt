@@ -201,6 +201,9 @@ if(CLAYBIN_TESTS)
     claybin_test(embed_test)
     claybin_test(cgroup_test)
     claybin_test(broker_test)
+    # the private-netns handoff: a guest in its own network namespace, and the
+    # listener its setup opened there, accepted from outside.
+    claybin_test(proxy_netns_live)
 
     # differential conformance against the real bwrap. skips itself when bwrap
     # is not installed, because the whole point is comparing against it rather

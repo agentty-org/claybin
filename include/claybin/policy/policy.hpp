@@ -101,6 +101,37 @@ struct PolicyData {
     // it. 0 leaves the inherited value alone.
     std::int32_t oom_score_adj{0};
 
+    // put the guest in its OWN network namespace even though it has network
+    // authority, and bring loopback up there.
+    //
+    // without this, "the guest may use the network" means sharing the host's
+    // namespace: the guest reaches 127.0.0.1 services the host runs (a dev
+    // server, a database, an unauthenticated admin port) and the whole LAN,
+    // and net_isolation can only be reported `partial`. landlock's port rules
+    // are the kernel-side answer but they filter by PORT, so :443 to a
+    // production host and :443 to a router are the same rule.
+    //
+    // with it the namespace is empty apart from `lo`, so nothing is reachable
+    // at all until the caller hands in a descriptor -- typically a connected
+    // socket to its own proxy, which can then apply name-based policy where
+    // the authority actually lives. the kernel enforces the boundary; the
+    // caller decides what crosses it.
+    bool netns_with_loopback{false};
+
+    // open a listening socket on the guest's loopback during setup and hand
+    // the descriptor back to the supervisor (ApplyFds::proxy_listen_fd).
+    // only meaningful with netns_with_loopback. the supervisor accepts on it
+    // from outside the namespace and decides what each connection may reach,
+    // so this is the channel that makes a private netns usable.
+    bool proxy_listener{false};
+
+    // the port the guest-side listener binds. the SUPERVISOR picks it, because
+    // it has to put the address in the guest's environment (http_proxy and
+    // friends) before exec, and the namespace does not exist until setup runs.
+    // any port is free in a fresh namespace, so there is nothing to collide
+    // with. 0 with proxy_listener means "kernel's choice", reported back.
+    std::uint16_t proxy_port{0};
+
     // close every inherited descriptor above stderr before the guest runs.
     //
     // ON BY DEFAULT, and that is a deliberate difference from bubblewrap. an
@@ -162,6 +193,12 @@ struct PolicyData {
         r.die_with_parent = die_with_parent || o.die_with_parent;
         // "kill me first" is hardening too: the higher value wins.
         r.oom_score_adj = oom_score_adj > o.oom_score_adj ? oom_score_adj : o.oom_score_adj;
+        // another hardening flag: either side asking for the private namespace
+        // gets it.
+        r.netns_with_loopback = netns_with_loopback || o.netns_with_loopback;
+        // a channel is authority: it survives only if both sides offered it.
+        r.proxy_listener = proxy_listener && o.proxy_listener;
+        r.proxy_port = proxy_port ? proxy_port : o.proxy_port;
         // hardening: whichever side wants it, wins.
         r.close_inherited_fds = close_inherited_fds || o.close_inherited_fds;
         // capabilities are authority, so this is a real meet: a capability
@@ -453,6 +490,22 @@ class Policy<Draft> {
     // range -1000..1000; see PolicyData::oom_score_adj.
     Policy&& oom_score_adj(std::int32_t v) && {
         data_.oom_score_adj = v < -1000 ? -1000 : v > 1000 ? 1000 : v;
+        return std::move(*this);
+    }
+    // an own network namespace with loopback up, even WITH net authority.
+    // see PolicyData::netns_with_loopback: nothing outside is reachable, so
+    // the caller must pass in whatever channel it wants the guest to have.
+    Policy&& private_netns() && {
+        data_.netns_with_loopback = true;
+        return std::move(*this);
+    }
+    // private_netns, plus a guest-side loopback listener the supervisor
+    // accepts on. see PolicyData::proxy_listener. `port` 0 lets the kernel
+    // choose, which the caller then reads from Spawned::proxy_port.
+    Policy&& proxied_netns(std::uint16_t port = 0) && {
+        data_.netns_with_loopback = true;
+        data_.proxy_listener = true;
+        data_.proxy_port = port;
         return std::move(*this);
     }
     // let the guest inherit the caller's open descriptors.

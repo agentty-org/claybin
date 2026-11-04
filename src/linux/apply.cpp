@@ -1254,6 +1254,7 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                 for (std::uint32_t k = 0; k < op.keep_count && nkeep < 32; ++k) {
                     std::uint32_t want = op.keep[k];
                     if (want == kReportFdSentinel) want = fds.report;
+                    else if (want == kProxyListenFdSentinel) want = fds.proxy_keep;
                     else if (want == kRelayFdSentinel) want = fds.relay;
                     else if (want == kRelayFd2Sentinel) want = fds.relay2;
                     else if (want >= kPreservedFdSentinelBase &&
@@ -1326,6 +1327,118 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                 } rl{op.soft, op.hard};
                 if (sys(SYS_prlimit64, 0, op.resource, reinterpret_cast<long>(&rl), 0) < 0)
                     return die(Errc::permission_denied, "setrlimit", errno);
+                return true;
+            }
+            case OpCode::loopback_up: {
+                LoopbackOp op{};
+                if (!decode(payload, op)) return die(Errc::invalid_policy, "loopback_up", 0);
+                // a fresh netns has `lo` DOWN, so even 127.0.0.1 is unreachable.
+                // ioctl on a throwaway socket rather than netlink: no
+                // allocation, no message building, and it is the one call that
+                // is safe this side of a fork.
+                constexpr long kAfInet = 2;
+                constexpr long kSockStream = 1;
+                constexpr long kSockDgram = 2;
+                constexpr long kSockCloexec = 0x80000;
+                const long fd = sys(SYS_socket, kAfInet, kSockDgram | kSockCloexec, 0);
+                if (fd < 0) return die(Errc::io_error, "loopback_up: socket", errno);
+                // from <net/if.h> and <linux/sockios.h>, named here so this
+                // file keeps its short include list. struct ifreq is 40 bytes
+                // with flags at offset 16 (asserted in plan_test).
+                constexpr unsigned long kSiocGifFlags = 0x8913;
+                constexpr unsigned long kSiocSifFlags = 0x8914;
+                constexpr short kIffUp = 0x1;
+                constexpr short kIffRunning = 0x40;
+                struct ifreq_min {
+                    char name[16];
+                    short flags;
+                    char pad[22];
+                } ifr{};
+                ifr.name[0] = 'l'; ifr.name[1] = 'o'; ifr.name[2] = '\0';
+                if (sys(SYS_ioctl, fd, static_cast<long>(kSiocGifFlags),
+                        reinterpret_cast<long>(&ifr)) < 0) {
+                    const int e = errno;
+                    sys(SYS_close, fd);
+                    return die(Errc::io_error, "loopback_up: get", e);
+                }
+                ifr.flags = static_cast<short>(ifr.flags | kIffUp | kIffRunning);
+                if (sys(SYS_ioctl, fd, static_cast<long>(kSiocSifFlags),
+                        reinterpret_cast<long>(&ifr)) < 0) {
+                    const int e = errno;
+                    sys(SYS_close, fd);
+                    return die(Errc::permission_denied, "loopback_up: set", e);
+                }
+                sys(SYS_close, fd);
+                if (op.listen_backlog == 0) return true;
+
+                // the proxy listener, bound to 127.0.0.1:0 so the kernel picks
+                // a free port. the supervisor accepts on this descriptor from
+                // OUTSIDE the namespace, which is allowed: an accepted socket
+                // belongs to the listener, not to the caller's namespace.
+                struct sockaddr_in_min {
+                    std::uint16_t family;
+                    std::uint16_t port;      // network order
+                    std::uint32_t addr;      // network order
+                    char zero[8];
+                } sa{};
+                sa.family = 2;  // AF_INET
+                {
+                    unsigned char* pb = reinterpret_cast<unsigned char*>(&sa.port);
+                    pb[0] = static_cast<unsigned char>((op.port >> 8) & 0xff);
+                    pb[1] = static_cast<unsigned char>(op.port & 0xff);
+                }
+                // 127.0.0.1 in network byte order, written byte-wise so this
+                // does not depend on htonl.
+                {
+                    unsigned char* b = reinterpret_cast<unsigned char*>(&sa.addr);
+                    b[0] = 127; b[1] = 0; b[2] = 0; b[3] = 1;
+                }
+                const long lfd = sys(SYS_socket, kAfInet, kSockStream | kSockCloexec, 0);
+                if (lfd < 0) return die(Errc::io_error, "loopback_up: listen socket", errno);
+                if (sys(SYS_bind, lfd, reinterpret_cast<long>(&sa), sizeof sa) < 0) {
+                    const int e = errno;
+                    sys(SYS_close, lfd);
+                    return die(Errc::io_error, "loopback_up: bind", e);
+                }
+                if (sys(SYS_listen, lfd, static_cast<long>(op.listen_backlog)) < 0) {
+                    const int e = errno;
+                    sys(SYS_close, lfd);
+                    return die(Errc::io_error, "loopback_up: listen", e);
+                }
+                {
+                    sockaddr_in_min got{};
+                    std::uint32_t len = sizeof got;
+                    if (sys(SYS_getsockname, lfd, reinterpret_cast<long>(&got),
+                            reinterpret_cast<long>(&len)) < 0) {
+                        const int e = errno;
+                        sys(SYS_close, lfd);
+                        return die(Errc::io_error, "loopback_up: getsockname", e);
+                    }
+                    const unsigned char* pb =
+                        reinterpret_cast<const unsigned char*>(&got.port);
+                    fds.proxy_port =
+                        static_cast<std::uint16_t>((pb[0] << 8) | pb[1]);
+                }
+                fds.proxy_listen_fd = static_cast<int>(lfd);
+                // keep it out of the close sweep, here and in every descendant
+                // that inherits it: see kProxyListenFdSentinel.
+                fds.proxy_keep = static_cast<std::uint32_t>(lfd);
+                // which netns did this land in? the supervisor logs it next to
+                // the guest's own, because "bound, but somewhere unreachable"
+                // is the one failure that looks like success here.
+                {
+                    char buf[64];
+                    const long nf = sys(SYS_readlinkat, -100 /* AT_FDCWD */,
+                                        reinterpret_cast<long>("/proc/self/ns/net"),
+                                        reinterpret_cast<long>(buf), sizeof buf - 1);
+                    if (nf > 0) {
+                        buf[nf] = '\0';
+                        std::uint64_t ino = 0;
+                        for (const char* p = buf; *p; ++p)
+                            if (*p >= '0' && *p <= '9') ino = ino * 10 + std::uint64_t(*p - '0');
+                        fds.proxy_netns_ino = ino;
+                    }
+                }
                 return true;
             }
             case OpCode::set_ids: {

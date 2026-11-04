@@ -312,6 +312,69 @@ int main() {
         });
     }
 
+    // -- private netns: the audit's #1 ------------------------------------
+    {
+        const auto hostcaps = HostCapabilities::modern_linux();
+        // network authority WITHOUT the flag: shared namespace, honest report.
+        auto shared = Policy<Draft>{}
+                          .read("/usr")
+                          .connect("", 0)
+                          .syscall_profile(profiles::with_network())
+                          .seal();
+        auto cs = compile(shared, hostcaps);
+        CHECK(cs.has_value());
+        if (cs) {
+            CHECK(cs->guarantees.strength(CapId::net_isolation) == Enforcement::partial);
+            CHECK(!cs->plan.has(OpCode::loopback_up));
+        }
+        // with it: own namespace, loopback up, and the same `strong` the
+        // no-network case reports.
+        auto priv = Policy<Draft>{}
+                        .read("/usr")
+                        .connect("", 0)
+                        .private_netns()
+                        .syscall_profile(profiles::with_network())
+                        .seal();
+        auto cp = compile(priv, hostcaps);
+        CHECK(cp.has_value());
+        if (cp) {
+            CHECK(cp->guarantees.strength(CapId::net_isolation) == Enforcement::strong);
+            CHECK(cp->plan.has(OpCode::loopback_up));
+            bool newnet = false;
+            cp->plan.for_each([&](OpCode code, std::span<const std::byte> payload) {
+                if (code == OpCode::unshare) {
+                    UnshareOp op{};
+                    Plan::decode(payload, op);
+                    newnet = (op.flags & 0x40000000) != 0;
+                }
+                return true;
+            });
+            CHECK(newnet);
+        }
+        // no network at all: still an empty namespace, and no loopback (there
+        // is nothing to reach).
+        auto none = Policy<Draft>{}
+                        .read("/usr")
+                        .private_netns()
+                        .syscall_profile(profiles::base())
+                        .seal();
+        auto cn = compile(none, hostcaps);
+        CHECK(cn.has_value());
+        if (cn) {
+            CHECK(cn->guarantees.strength(CapId::net_isolation) == Enforcement::strong);
+            CHECK(!cn->plan.has(OpCode::loopback_up));
+        }
+        // a host with no netns cannot pretend: no op, and the claim degrades.
+        HostCapabilities no_netns = hostcaps;
+        no_netns.net_namespaces = false;
+        auto cx = compile(priv, no_netns);
+        CHECK(cx.has_value());
+        if (cx) {
+            CHECK(cx->guarantees.strength(CapId::net_isolation) != Enforcement::strong);
+            CHECK(!cx->plan.has(OpCode::loopback_up));
+        }
+    }
+
     // -- hardened refuses to downgrade ------------------------------------
     {
         HostCapabilities weak;

@@ -117,6 +117,21 @@ enum class OpCode : std::uint16_t {
     drop_caps,
     no_new_privs,
     seccomp_install,
+    // bring `lo` up inside a fresh network namespace, and (when the policy
+    // asked for proxied network) open a listening socket on 127.0.0.1 there.
+    //
+    // a new netns has a loopback device but it is DOWN, so 127.0.0.1 is
+    // unreachable until someone flips IFF_UP -- which needs CAP_NET_ADMIN,
+    // and we have it in our own user namespace. no address to assign:
+    // 127.0.0.1/8 is built in.
+    //
+    // the listener exists because only a process INSIDE the namespace can
+    // create one: setns(pidfd, CLONE_NEWNET) from the supervisor is EPERM
+    // (it would need CAP_SYS_ADMIN in the guest's user namespace). so the
+    // guest's own setup opens it and hands the descriptor back, and the
+    // supervisor accepts on it from outside. apply() writes the fd and port
+    // into ApplyFds.
+    loopback_up,
 };
 
 constexpr Phase phase_of(OpCode c) {
@@ -133,6 +148,12 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::pivot_root:
         case OpCode::pivot_into_newroot:
         case OpCode::umount: return Phase::mounts;
+        // the loopback listener belongs to the OUTER setup process: the
+        // namespace phase runs before the fork into the pid namespace, so the
+        // descriptor is held by a process that outlives the guest's exec.
+        // anywhere later it would be the guest's own fd and die with exec,
+        // leaving nothing listening.
+        case OpCode::loopback_up: return Phase::namespaces;
         case OpCode::dup2: return Phase::fds;
         // close_range lives in privdrop, not fds. it has to run AFTER the mount
         // phase (which uses --file source fds) and after the landlock ruleset fd
@@ -167,6 +188,7 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::bind_target: return "bind_target";
         case OpCode::symlink_at: return "symlink";
         case OpCode::write_fd_content: return "write_fd";
+        case OpCode::loopback_up: return "loopback_up";
         case OpCode::pivot_root: return "pivot_root";
         case OpCode::pivot_into_newroot: return "pivot_newroot";
         case OpCode::umount: return "umount";
@@ -290,6 +312,13 @@ inline constexpr std::uint32_t kRelayFdSentinel = 0xfffffffdu;
 // number on one, and the CLONE_FILES helper -- which shares the same descriptor
 // table -- reads it on the other. closing either breaks the handoff silently.
 inline constexpr std::uint32_t kRelayFd2Sentinel = 0xfffffffcu;
+// and the guest-side proxy listener. it is opened in the namespace phase and
+// then INHERITED down the fork chain; the close sweep runs in a descendant,
+// and closing it there drops the last in-namespace reference to the socket --
+// so the bind goes away and the guest finds nothing listening on its own
+// loopback, with no error anywhere. apply() fills this in once the listener
+// exists, which is before the sweep in every ordering.
+inline constexpr std::uint32_t kProxyListenFdSentinel = 0xfffffffbu;
 
 // descriptors the CALLER asked to carry into the guest (Command::fds and the
 // stdio shorthand). a range rather than one sentinel, because an embedder
@@ -310,15 +339,32 @@ struct ApplyFds {
     std::uint32_t report = 0xffffffffu;   // kReportFdSentinel
     std::uint32_t relay  = 0xffffffffu;   // kRelayFdSentinel
     std::uint32_t relay2 = 0xffffffffu;   // kRelayFd2Sentinel
+    // kProxyListenFdSentinel. set by apply() itself when loopback_up opens
+    // the listener, not by spawn(): it is the same ApplyFds, so a later phase
+    // in the SAME apply sees it, and so does a descendant's sweep.
+    std::uint32_t proxy_keep = 0xffffffffu;
     // slot N is kPreservedFdSentinelBase + N.
     std::uint32_t preserved[kMaxPreservedFds] = {
         0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
         0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
     };
     int notify_fd = -1;
+    // the guest-side proxy listener opened by loopback_up, and the port the
+    // kernel chose for it. -1/0 when the plan did not ask for one.
+    int proxy_listen_fd = -1;
+    std::uint16_t proxy_port = 0;
+    // the netns inode the listener was bound in, for the "bound somewhere
+    // unreachable" diagnosis.
+    std::uint64_t proxy_netns_ino = 0;
 };
 struct SetHostnameOp {
     Ref name;
+};
+// loopback_up's payload: listen != 0 means also open a 127.0.0.1 listener
+// with this backlog and report it back through ApplyFds.
+struct LoopbackOp {
+    std::uint32_t listen_backlog;
+    std::uint32_t port;   // 0 = let the kernel choose
 };
 struct ChdirOp {
     Ref path;

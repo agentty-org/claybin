@@ -206,8 +206,15 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
 
     // a policy with no network authority gets an empty network namespace, which
     // is a stronger and cheaper guarantee than filtering socket syscalls.
+    //
+    // netns_with_loopback asks for the namespace EVEN WITH authority: the
+    // guest keeps its sockets but the only peer it can reach is itself, so
+    // the host's loopback services and the LAN are simply not there. a caller
+    // that wants outbound traffic passes in a descriptor for it.
     const bool wants_net = !d.net.is_nothing();
-    if (!wants_net && host.net_namespaces) unshare_flags |= kCloneNewnet;
+    const bool private_netns = host.net_namespaces
+        && (!wants_net || d.netns_with_loopback);
+    if (private_netns) unshare_flags |= kCloneNewnet;
 
     if (unshare_flags) b.op(OpCode::unshare, UnshareOp{unshare_flags});
 
@@ -260,11 +267,24 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
              WriteFileOp{b.intern("/proc/self/oom_score_adj"), b.intern(buf)});
     }
 
+    // loopback, and the proxy listener on it. this is a NAMESPACE-phase op
+    // (see phase_of): it needs the new netns, which the unshare above just
+    // made, and the listener must be held by this process rather than the
+    // guest -- the guest's copy would close on exec.
+    if (private_netns && wants_net)
+        b.op(OpCode::loopback_up,
+             LoopbackOp{d.proxy_listener ? 128u : 0u, d.proxy_port});
+
     if (!wants_net) {
         if (host.net_namespaces)
             report.record(CapId::net_isolation, Enforcement::strong, "netns");
         else
             degrade(CapId::net_isolation);
+    } else if (private_netns) {
+        // the namespace is the boundary, so this is the same `strong` the
+        // no-network case gets. what the guest may reach THROUGH a passed-in
+        // descriptor is the caller's policy, not a weaker kernel wall.
+        report.record(CapId::net_isolation, Enforcement::strong, "netns+loopback");
     } else {
         // brokered network is only as strong as the notify supervisor, and we
         // have not built it yet. say so.
@@ -882,6 +902,10 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 cr.keep[cr.keep_count++] = kRelayFdSentinel;
             if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
                 cr.keep[cr.keep_count++] = kRelayFd2Sentinel;
+            // and the guest's proxy listener: the sweep runs in a process that
+            // INHERITED it, and closing it there unbinds the socket.
+            if (cr.keep_count < sizeof cr.keep / sizeof cr.keep[0])
+                cr.keep[cr.keep_count++] = kProxyListenFdSentinel;
             // and whatever descriptors the CALLER will ask spawn() to carry in.
             //
             // the sentinels are always emitted, even though most callers use
@@ -933,8 +957,20 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // netns expression at all. combining them gives a guest with no netns
         // isolation (because it needs SOME network) a per-port restriction it
         // could not otherwise have.
+        //
+        // BUT only when there are per-port rules to add. landlock is
+        // deny-by-default over whatever the ruleset HANDLES, so handling
+        // connect_tcp and then adding no rules denies every connect the guest
+        // makes -- including one to a proxy on its own loopback. a blanket
+        // grant ("any port") has no landlock expression, so handling it is not
+        // a weaker wall, it is a broken one.
+        const bool net_by_port =
+            wants_net && !d.net.blanket().any(kNetConnect)
+            && !d.net.blanket().any(kNetBind)
+            && std::any_of(d.net.endpoints().begin(), d.net.endpoints().end(),
+                           [](const NetEndpoint& e) { return e.port != 0; });
         std::uint64_t handled_net = 0;
-        const bool want_net_rules = host.landlock_abi >= 4 && wants_net;
+        const bool want_net_rules = host.landlock_abi >= 4 && net_by_port;
         if (want_net_rules) handled_net = kLlBindTcp | kLlConnectTcp;
 
         // when a tree was built, landlock rules apply to the SANDBOX paths, not
@@ -1014,23 +1050,17 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // enforced.
         bool net_fully_enforced = want_net_rules;
         if (want_net_rules) {
-            if (d.net.blanket().any(kNetConnect) || d.net.blanket().any(kNetBind)) {
-                // a blanket grant is "any port", so per-port rules would be a
-                // lie by omission.
-                net_fully_enforced = false;
-            } else {
-                for (const auto& e : d.net.endpoints()) {
-                    if (e.port == 0) {
-                        net_fully_enforced = false;
-                        continue;
-                    }
-                    std::uint64_t allowed = 0;
-                    if (e.ops.any(kNetConnect)) allowed |= kLlConnectTcp;
-                    if (e.ops.any(kNetBind)) allowed |= kLlBindTcp;
-                    if (allowed == 0) continue;
-                    b.op(OpCode::landlock_net_rule,
-                         LandlockNetRuleOp{allowed, e.port, {}});
+            for (const auto& e : d.net.endpoints()) {
+                if (e.port == 0) {
+                    net_fully_enforced = false;
+                    continue;
                 }
+                std::uint64_t allowed = 0;
+                if (e.ops.any(kNetConnect)) allowed |= kLlConnectTcp;
+                if (e.ops.any(kNetBind)) allowed |= kLlBindTcp;
+                if (allowed == 0) continue;
+                b.op(OpCode::landlock_net_rule,
+                     LandlockNetRuleOp{allowed, e.port, {}});
             }
         }
 

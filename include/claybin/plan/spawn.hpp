@@ -75,6 +75,15 @@ struct Spawned {
     // it: wrap it in a broker::Listener and answer every notification, or the
     // guest blocks forever on its first brokered call.
     int notify_fd{-1};
+    // the guest-side loopback listener, when the policy asked for one
+    // (proxied_netns). the CALLER owns it: accept on it and decide what each
+    // connection may reach. `proxy_port` is where it is bound inside the
+    // guest's namespace, which is what the guest's proxy env vars must name.
+    int proxy_listen_fd{-1};
+    std::uint16_t proxy_port{0};
+    // the netns inode that listener is bound in. the guest's own netns must
+    // match, or the proxy is listening where nothing can reach it.
+    std::uint64_t proxy_netns_ino{0};
 };
 
 // fork, apply the plan in the child, exec. returns in the parent only.

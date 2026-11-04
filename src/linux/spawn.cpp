@@ -354,6 +354,65 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // namespace. it is pid 1 there, and forks once more below so the guest
         // is not (see the shepherd).
         auto st = plan.apply_until(Phase::mounts, afds);
+
+        // PROXY LISTENER HANDOFF, before the fork into the pid namespace.
+        //
+        // The listener was opened by the namespace phase, in THIS process. It
+        // has to reach the supervisor from here: the forks below lead to the
+        // guest, whose copy closes on exec, and the supervisor cannot make one
+        // itself (setns into the guest's netns is EPERM).
+        //
+        // Unlike the seccomp listener this is an ordinary socket and nnp is
+        // not set yet, so one SCM_RIGHTS sendmsg is enough.
+        if (st && afds.proxy_listen_fd >= 0) {
+            const int pfd = std::exchange(afds.proxy_listen_fd, -1);
+            struct iovec iov{};
+            const std::uint16_t port = afds.proxy_port;
+            char payload[11] = {'P', static_cast<char>(port & 0xff),
+                                static_cast<char>((port >> 8) & 0xff)};
+            {
+                std::uint64_t ino = afds.proxy_netns_ino;
+                for (int k = 0; k < 8; ++k)
+                    payload[3 + k] = static_cast<char>((ino >> (8 * k)) & 0xff);
+            }
+            iov.iov_base = payload;
+            iov.iov_len = sizeof payload;
+            union {
+                char buf[CMSG_SPACE(sizeof(int))];
+                struct cmsghdr align;
+            } u{};
+            struct msghdr msg{};
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = u.buf;
+            msg.msg_controllen = sizeof u.buf;
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type = SCM_RIGHTS;
+            cm->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(cm), &pfd, sizeof pfd);
+            ssize_t sent;
+            do sent = ::sendmsg(report[1], &msg, 0);
+            while (sent < 0 && errno == EINTR);
+            // NOT closed here, and that is the whole trick. A socket's bind
+            // belongs to the network namespace, and the namespace lives only
+            // as long as a process in it holds something open. Closing our
+            // copy would leave the supervisor holding the only reference --
+            // from OUTSIDE -- and the guest would find nothing listening on
+            // its own loopback. Left open, it is inherited by the shepherd
+            // (pid 1 of the namespace), which outlives the guest, so the bind
+            // stands for the box's whole life and goes away with it.
+            if (sent != sizeof payload) {
+                f.stage = 0;
+                f.code = static_cast<int>(Errc::io_error);
+                f.sys_errno = errno;
+                for (int k = 0; k < 11; ++k) f.mech[k] = "proxy: send"[k];
+                ::close(pfd);
+                ssize_t ig = ::write(report[1], &f, sizeof f);
+                (void)ig;
+                ::_exit(kExitPlanFailed);
+            }
+        }
         if (st) {
             // a raw clone, NOT glibc's fork(). we got here through a raw
             // clone3 of a threaded process, which skips glibc's fork handling,
@@ -714,7 +773,52 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         }
     }
     int received_fd = -1;
+    int proxy_fd = -1;
+    std::uint16_t proxy_port = 0;
+    std::uint64_t proxy_netns_ino = 0;
     ssize_t n;
+    // the proxy listener, when the plan opened one, is sent FIRST and tagged
+    // 'P' so it cannot be confused with the broker handoff or a failure
+    // report. MSG_PEEK: if the first message is not ours, leave it for the
+    // read below untouched.
+    if (plan.has(OpCode::loopback_up)) {
+        char tag[11] = {};
+        struct iovec piov{};
+        piov.iov_base = tag;
+        piov.iov_len = sizeof tag;
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } pu{};
+        struct msghdr pmsg{};
+        pmsg.msg_iov = &piov;
+        pmsg.msg_iovlen = 1;
+        pmsg.msg_control = pu.buf;
+        pmsg.msg_controllen = sizeof pu.buf;
+        ssize_t pn;
+        do pn = ::recvmsg(report[0], &pmsg, MSG_PEEK);
+        while (pn < 0 && errno == EINTR);
+        if (pn == sizeof tag && tag[0] == 'P') {
+            // ours: take it for real this time.
+            pmsg.msg_controllen = sizeof pu.buf;
+            pmsg.msg_flags = 0;
+            do pn = ::recvmsg(report[0], &pmsg, 0);
+            while (pn < 0 && errno == EINTR);
+            if (pn == sizeof tag && !(pmsg.msg_flags & MSG_CTRUNC))
+                if (struct cmsghdr* cm = CMSG_FIRSTHDR(&pmsg);
+                    cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+                    cm->cmsg_len == CMSG_LEN(sizeof proxy_fd)) {
+                    std::memcpy(&proxy_fd, CMSG_DATA(cm), sizeof proxy_fd);
+                    proxy_port = static_cast<std::uint16_t>(
+                        (static_cast<unsigned char>(tag[1])) |
+                        (static_cast<unsigned char>(tag[2]) << 8));
+                    for (int k = 0; k < 8; ++k)
+                        proxy_netns_ino |= static_cast<std::uint64_t>(
+                                               static_cast<unsigned char>(tag[3 + k]))
+                                           << (8 * k);
+                }
+        }
+    }
     {
         struct iovec iov{};
         iov.iov_base = &f;
@@ -745,7 +849,9 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
     // the helper shares the guest's fd table, which is why no pidfd_getfd dance
     // is needed: the number the guest got is already valid in the helper.
 
-    if (received_fd >= 0 && n == 1) return Spawned{static_cast<int>(pid), pidfd, received_fd};
+    if (received_fd >= 0 && n == 1)
+        return Spawned{static_cast<int>(pid), pidfd, received_fd, proxy_fd, proxy_port,
+                       proxy_netns_ino};
 
     if (n == static_cast<ssize_t>(sizeof f)) {
         // the child told us why. reap it so we do not leave a zombie, then
@@ -753,13 +859,14 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         int status = 0;
         ::waitpid(static_cast<pid_t>(pid), &status, 0);
         if (pidfd >= 0) ::close(pidfd);
+        if (proxy_fd >= 0) ::close(proxy_fd);
         f.mech[sizeof(f.mech) - 1] = '\0';
         return std::unexpected(Error{f.stage == 0 ? static_cast<Errc>(f.code) : Errc::spawn_failed,
                                      f.stage == 0 ? static_mechanism(f.mech) : "execve",
                                      f.sys_errno});
     }
 
-    return Spawned{static_cast<int>(pid), pidfd, -1};
+    return Spawned{static_cast<int>(pid), pidfd, -1, proxy_fd, proxy_port, proxy_netns_ino};
 }
 
 }  // namespace clay
