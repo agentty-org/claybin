@@ -94,12 +94,15 @@ four entries deserve a note because they surprised me:
   not delegate the `cpu` controller to user sessions even when they delegate
   `memory` and `pids`. claybin reports `none` with that exact reason rather than
   pretending a quota was applied.
-- **macOS network isolation is two different answers, not one.** `(deny
+- **macOS network isolation is three different answers, not one.** `(deny
   network*)` is a single rule the kernel enforces exactly, so denying the
   network outright is genuinely `strong` -- equal to an empty netns in what the
-  guest can reach. an endpoint *allow-list* is `partial`, because seatbelt
-  matches on the address and the name-to-address step happens in userspace
-  where DNS can answer differently next time.
+  guest can reach. `proxied_netns(port)` is also `strong`: no private netns
+  exists, but `(remote ip "localhost:PORT")` pins outbound IP to the one port
+  the supervisor serves, which is the same shape as linux's proxied netns. an
+  endpoint *allow-list* is `partial`, because seatbelt matches on the address
+  and the name-to-address step happens in userspace where DNS can answer
+  differently next time.
 - **macOS pid limits are `advisory`, not `partial`.** RLIMIT_NPROC counts
   processes for the whole UID rather than for this process tree, so another
   terminal window moves the limit. that is not a boundary, and calling it
@@ -226,6 +229,53 @@ reasons: doing it after requires the profile to permit `open("/dev/null")` and
 to stderr when a profile is refused. with stderr not yet redirected, that
 message lands on the caller's terminal instead of in the pipe they supplied for
 exactly this purpose.
+
+### the three side channels a "deny default" profile still has
+
+every one of these was measured open, and every one is now a route in
+`tests/macos_escape_corpus_test.cpp`, which plants a canary outside the grant
+and fails if any route brings it back. mutation-checked: put either blanket
+grant back and it fails.
+
+- **`(allow mach-lookup)` with no filter** is the widest hole a seatbelt profile
+  can have. every launchd service is a confused deputy running OUTSIDE the
+  sandbox: with it on, a guest with no home grant and no network read the
+  pasteboard (`pbpaste`) and listed the keychains (`security`). services are
+  an allowlist by `global-name` -- directory lookups, logging, cfprefsd,
+  dirhelper (`confstr(DARWIN_USER_TEMP_DIR)`, without which xcrun, python and
+  git fail at startup). DNS and TLS-trust services are emitted only on a
+  network-allowing profile, and `com.apple.SecurityServer` never: it is the
+  keychain daemon, and TLS verifies through trustd alone.
+- **`(allow file-read-metadata)` with no filter** is a disk-wide stat oracle:
+  "does `~/.ssh/id_ed25519` exist", its size and mtime. readdir and content
+  stayed walled; existence did not. metadata is now `/`'s children
+  (`(regex #"^/[^/]+$")`) plus a `(literal ...)` on every ancestor of every
+  grant -- what realpath, getcwd and git's repo discovery actually walk.
+- **the network itself**, when "full" compiled to `(allow network*)`: a guest
+  could reach the host's loopback services and the LAN. see `proxied_netns`
+  above. `proxy_listener` is checked BEFORE the blanket connect, because the
+  embedder spells "proxied full network" as `connect("", 0)` +
+  `proxied_netns`, and reading the blanket first would hand out the hole.
+
+what no profile can do, so the corpus does not claim it: `launchctl print`
+travels over the bootstrap port every process is born holding, so it cannot be
+withheld (it is read-only; `launchctl submit` is refused). and setuid binaries
+(`/bin/ps`) never exec under any seatbelt profile.
+
+### signal (target same-sandbox), not self
+
+`(allow signal (target self))` looks like the tight choice and breaks every
+guest that kills its own children: `timeout`, `kill %1`, a build tool's worker
+pool. `same-sandbox` covers the guest's own tree and nothing outside it.
+
+### pty and semaphores are ordinary needs
+
+`openpty()` (`script`, expect, python's `pty`) needs `(allow pseudo-tty)` and
+`/dev/ptmx`; a tty handed in before `sandbox_init` lacks the pty extension, so
+ioctl on `/dev/ttysN` is granted separately or an interactive shell decides it
+has no terminal. python's `multiprocessing` needs `ipc-posix-sem`. and
+`process-info*` is scoped to `same-sandbox`, so `ps`-style queries see the
+guest's own tree, not the host's.
 
 ## notes from writing the windows backend
 
