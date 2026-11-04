@@ -375,6 +375,47 @@ int main() {
         }
     }
 
+    // -- landlock abi gating: pathname unix sockets (abi 9) ----------------
+    //
+    // Measured on a real abi-10 host before this went in: without
+    // RESOLVE_UNIX in the handled set, a landlock-confined process connects
+    // to ANY pathname unix socket whatever its filesystem grants say. With
+    // it, the same connect is EPERM. The host's dbus, docker and database
+    // sockets are all pathname sockets, so the bit is worth asking for --
+    // but only where the kernel knows it, because create_ruleset fails
+    // outright on a bit it does not recognise.
+    {
+        constexpr std::uint64_t kResolveUnix = 1ull << 16;
+        auto pol = Policy<Draft>{}
+                       .read("/usr")
+                       .syscall_profile(profiles::base())
+                       .seal();
+        auto allowed_bits = [&](std::uint32_t abi) -> std::uint64_t {
+            HostCapabilities h = HostCapabilities::modern_linux();
+            h.landlock_abi = abi;
+            auto c = compile(pol, h);
+            CHECK(c.has_value());
+            std::uint64_t seen = 0;
+            if (c)
+                c->plan.for_each([&](OpCode code, std::span<const std::byte> payload) {
+                    if (code == OpCode::landlock_rule) {
+                        LandlockRuleOp op{};
+                        Plan::decode(payload, op);
+                        seen |= op.allowed;
+                    }
+                    return true;
+                });
+            return seen;
+        };
+        // abi 5 is the old ceiling: the bit must NOT appear, or the ruleset
+        // is rejected by the kernel and the guest runs unconfined.
+        CHECK((allowed_bits(5) & kResolveUnix) == 0);
+        CHECK((allowed_bits(8) & kResolveUnix) == 0);
+        // abi 9 is where the kernel learned it; a read grant carries it.
+        CHECK((allowed_bits(9) & kResolveUnix) != 0);
+        CHECK((allowed_bits(10) & kResolveUnix) != 0);
+    }
+
     // -- W^X: the arg rule is partial, MDWE is the real wall ---------------
     {
         const auto hostcaps = HostCapabilities::modern_linux();

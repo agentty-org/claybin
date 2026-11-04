@@ -68,6 +68,7 @@ constexpr std::uint64_t kLlMakeSym = 1ull << 12;
 constexpr std::uint64_t kLlRefer = 1ull << 13;     // abi 2
 constexpr std::uint64_t kLlTruncate = 1ull << 14;  // abi 3
 constexpr std::uint64_t kLlIoctlDev = 1ull << 15;  // abi 5
+constexpr std::uint64_t kLlResolveUnix = 1ull << 16;  // abi 9
 
 // rlimit resource numbers
 constexpr std::uint32_t kRlimitCpu = 0;
@@ -99,6 +100,15 @@ std::uint64_t to_landlock(FileRights r, std::uint32_t abi) {
     if (abi >= 2 && r.any(FileRights{FileRights::kRename})) out |= kLlRefer;
     if (abi >= 3 && r.any(FileRights{FileRights::kTruncate})) out |= kLlTruncate;
     if (abi >= 5 && r.any(FileRights{FileRights::kIoctlDev})) out |= kLlIoctlDev;
+    // connecting to a PATHNAME unix socket, granted wherever read is.
+    //
+    // "may read this path" and "may talk to a socket at this path" are the
+    // same authority in practice: the socket is a filesystem object, and a
+    // guest that can open files in a directory can already see what is there.
+    // Granting it with read keeps the vocabulary at one concept instead of
+    // adding a FileRights bit every caller would have to remember.
+    if (abi >= 9 && r.any(FileRights{FileRights::kReadFile}))
+        out |= kLlResolveUnix;
     return out;
 }
 
@@ -111,11 +121,12 @@ constexpr std::uint64_t kLlConnectTcp = 1ull << 1;
 // the full set of rights a ruleset governs, for this abi. anything not in here
 // is simply not mediated by landlock, so the report must not claim it is.
 //
-// IMPORTANT: we only ever ask for bits we actually know about. landlock keeps
-// adding access rights (abi 10 has several we do not model), and asking for a
-// bit the kernel does not know makes create_ruleset fail -- but under-asking is
-// safe, it just means those operations are unmediated. since our FileRights
-// vocabulary tops out at the abi-5 set, that is what we hand over.
+// IMPORTANT: only ever ask for bits we actually know about. landlock keeps
+// adding access rights, and asking for one the kernel does not know makes
+// create_ruleset fail outright -- while under-asking is safe but silently
+// unmediated, which is the failure mode worth hunting. the FileRights
+// vocabulary covers the abi-5 filesystem set plus RESOLVE_UNIX (abi 9); abi
+// 10's UDP rules live on the NET side, see handled_net.
 std::uint64_t handled_access(std::uint32_t abi) {
     std::uint64_t h = kLlExecute | kLlWriteFile | kLlReadFile | kLlReadDir | kLlRemoveDir |
                       kLlRemoveFile | kLlMakeChar | kLlMakeDir | kLlMakeReg | kLlMakeSock |
@@ -123,6 +134,16 @@ std::uint64_t handled_access(std::uint32_t abi) {
     if (abi >= 2) h |= kLlRefer;
     if (abi >= 3) h |= kLlTruncate;
     if (abi >= 5) h |= kLlIoctlDev;
+    // abi 9: pathname unix sockets.
+    //
+    // THE GAP THIS CLOSES, measured rather than assumed. Without this bit in
+    // the handled set, a landlock-confined process connects to ANY pathname
+    // unix socket regardless of its filesystem grants -- the mount tree is
+    // the only thing in the way, and a socket the guest can see by path it
+    // can talk to. The host's dbus, docker and database sockets are all
+    // pathname sockets. Abstract sockets were already covered by scoping
+    // (abi 6); this is the other half.
+    if (abi >= 9) h |= kLlResolveUnix;
     return h;
 }
 
