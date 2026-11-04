@@ -532,6 +532,173 @@ inline int abstract_unix_live() {
 }
 
 // ---------------------------------------------------------------------------
+// the network namespace boundary
+// ---------------------------------------------------------------------------
+//
+// The filesystem attacks above have had a corpus since the start; the network
+// boundary had none, which is why a shared netns went unnoticed long enough to
+// become an audit finding. These are the specific things a guest would try.
+//
+// A netns is all-or-nothing, so most of these are a single question asked of
+// several targets: can a datagram or a connection leave this namespace at all?
+
+// the host's own loopback. THE finding: a sandbox sharing the host netns
+// reaches every service on 127.0.0.1 -- a dev server, a database, another
+// agent's debug port, an unauthenticated admin interface.
+//
+// The supervisor binds a real listener outside and passes its port in, for the
+// same reason abstract_unix_live does: connecting to a port nobody holds fails
+// either way, so an empty port cannot tell "isolated" from "reachable".
+inline int net_host_loopback() {
+    const char* port_s = ::getenv("CLAY_LOOPBACK_PROBE_PORT");
+    if (!port_s || !*port_s) return kNotApplicable;
+    int port = 0;
+    for (const char* p = port_s; *p >= '0' && *p <= '9'; ++p) port = port * 10 + (*p - '0');
+    if (port <= 0 || port > 65535) return kNotApplicable;
+
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return kBlocked;
+    struct sockaddr_in_min {
+        unsigned short family;
+        unsigned short port;
+        unsigned int addr;
+        char zero[8];
+    } a{};
+    a.family = AF_INET;
+    a.port = static_cast<unsigned short>((port >> 8) | ((port & 0xff) << 8));   // htons
+    unsigned char* ab = reinterpret_cast<unsigned char*>(&a.addr);
+    ab[0] = 127; ab[1] = 0; ab[2] = 0; ab[3] = 1;
+    const int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&a), sizeof a);
+    ::close(s);
+    // The listener exists, so success is an escape and anything else means we
+    // are in a different network namespace -- which is the wall working.
+    return r == 0 ? kEscaped : kBlocked;
+}
+
+// a datagram to the host's loopback. UDP is a separate landlock access right
+// (abi 10) and a separate thing to forget: a connect-based test says nothing
+// about sendto.
+//
+// THE CARE THIS NEEDS, and the first version got it wrong. sendto() on UDP is
+// fire-and-forget: in the guest's OWN netns it succeeds, because the kernel
+// happily accepts a datagram addressed to the guest's own loopback where
+// nothing is listening. A successful send is therefore NOT an escape. The
+// escape is a REPLY -- which only arrives if the packet reached the host's
+// echo listener.
+inline int net_host_loopback_udp() {
+    const char* port_s = ::getenv("CLAY_LOOPBACK_PROBE_PORT");
+    if (!port_s || !*port_s) return kNotApplicable;
+    int port = 0;
+    for (const char* p = port_s; *p >= '0' && *p <= '9'; ++p) port = port * 10 + (*p - '0');
+    if (port <= 0) return kNotApplicable;
+
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return kBlocked;
+    // A short timeout: we are proving a negative, so waiting long buys
+    // nothing and a hung attack reads as a hung test.
+    struct timeval tv{};
+    tv.tv_sec = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    struct sockaddr_in_min {
+        unsigned short family;
+        unsigned short port;
+        unsigned int addr;
+        char zero[8];
+    } a{};
+    a.family = AF_INET;
+    a.port = static_cast<unsigned short>((port >> 8) | ((port & 0xff) << 8));
+    unsigned char* ab = reinterpret_cast<unsigned char*>(&a.addr);
+    ab[0] = 127; ab[1] = 0; ab[2] = 0; ab[3] = 1;
+    const char byte = 'x';
+    if (::sendto(s, &byte, 1, 0, reinterpret_cast<struct sockaddr*>(&a), sizeof a) < 0) {
+        // Refused outright (EPERM under a landlock port rule, ENETUNREACH in
+        // an empty namespace). Blocked before it left.
+        ::close(s);
+        return kBlocked;
+    }
+    char reply[8]{};
+    const long got = ::recv(s, reply, sizeof reply, 0);
+    ::close(s);
+    // A reply means the host's listener answered us: the datagram crossed the
+    // boundary. No reply means it went into our own empty loopback.
+    return got > 0 ? kEscaped : kBlocked;
+}
+
+// the LAN. the other half of the same finding: the router's admin page, a NAS,
+// a colleague's laptop. no listener is needed -- what matters is whether a
+// SYN can leave, and a 200 ms connect that returns ENETUNREACH immediately is
+// a different answer from one that times out.
+inline int net_lan_reachable() {
+    int s = ::socket(AF_INET, SOCK_STREAM | 04000 /*SOCK_NONBLOCK*/, 0);
+    if (s < 0) return kBlocked;
+    struct sockaddr_in_min {
+        unsigned short family;
+        unsigned short port;
+        unsigned int addr;
+        char zero[8];
+    } a{};
+    a.family = AF_INET;
+    a.port = 0x5000;   // htons(80)
+    unsigned char* ab = reinterpret_cast<unsigned char*>(&a.addr);
+    ab[0] = 192; ab[1] = 168; ab[2] = 1; ab[3] = 1;
+    const int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&a), sizeof a);
+    const int e = errno;
+    ::close(s);
+    if (r == 0) return kEscaped;            // immediate success: reachable
+    // EINPROGRESS means the SYN is on its way: the packet left the namespace,
+    // which is the escape even if nothing answers. ENETUNREACH/EPERM mean it
+    // never got out.
+    return e == EINPROGRESS ? kEscaped : kBlocked;
+}
+
+// cloud metadata. 169.254.169.254 hands out IAM credentials to anything that
+// can reach it, which makes it the highest-value target on this list for a
+// sandbox running on a cloud host.
+inline int net_cloud_metadata() {
+    int s = ::socket(AF_INET, SOCK_STREAM | 04000, 0);
+    if (s < 0) return kBlocked;
+    struct sockaddr_in_min {
+        unsigned short family;
+        unsigned short port;
+        unsigned int addr;
+        char zero[8];
+    } a{};
+    a.family = AF_INET;
+    a.port = 0x5000;   // htons(80)
+    unsigned char* ab = reinterpret_cast<unsigned char*>(&a.addr);
+    ab[0] = 169; ab[1] = 254; ab[2] = 169; ab[3] = 254;
+    const int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&a), sizeof a);
+    const int e = errno;
+    ::close(s);
+    if (r == 0) return kEscaped;
+    return e == EINPROGRESS ? kEscaped : kBlocked;
+}
+
+// a PATHNAME unix socket, which is the half that landlock scoping does NOT
+// cover: scoping (abi 6) is about abstract names, and RESOLVE_UNIX (abi 9) is
+// what mediates sockets that live in the filesystem. dbus, docker and postgres
+// all listen on pathname sockets.
+inline int net_pathname_unix() {
+    const char* path = ::getenv("CLAY_PATHNAME_SOCK");
+    if (!path || !*path) return kNotApplicable;
+    int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return kBlocked;
+    struct sockaddr_un {
+        unsigned short family;
+        char path[108];
+    } a{};
+    a.family = AF_UNIX;
+    std::size_t n = std::strlen(path);
+    if (n > sizeof a.path - 1) n = sizeof a.path - 1;
+    std::memcpy(a.path, path, n);
+    const int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&a), sizeof a);
+    ::close(s);
+    // The listener exists outside, so reaching it is the escape.
+    return r == 0 ? kEscaped : kBlocked;
+}
+
+// ---------------------------------------------------------------------------
 // the table
 // ---------------------------------------------------------------------------
 
@@ -604,6 +771,13 @@ inline const Attack* table(std::size_t& count) {
         {"net.raw_socket", net_raw_socket, false},
         {"net.abstract_unix", abstract_unix_socket, false},
         {"net.abstract_unix_live", abstract_unix_live, false},
+        // the netns boundary. the supervisor passes a real target in for the
+        // two that need one; the rest ask whether a packet can leave at all.
+        {"net.host_loopback", net_host_loopback, false},
+        {"net.host_loopback_udp", net_host_loopback_udp, false},
+        {"net.lan", net_lan_reachable, false},
+        {"net.cloud_metadata", net_cloud_metadata, false},
+        {"net.pathname_unix", net_pathname_unix, false},
         // the flag-argument attacks. each of these is allowed by a filter that
         // checks syscall NUMBERS only, which is why argument filtering exists.
         {"ns.clone_newuser", clone_userns, false},

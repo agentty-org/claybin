@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -279,6 +280,158 @@ int main(int argc, char** argv) {
         }
     } else {
         std::fprintf(stderr, "  scoping: skipped, landlock abi %u < 6\n\n", host.landlock_abi);
+    }
+
+    // ── the netns boundary ─────────────────────────────────────────────
+    //
+    // Same shape as the scoping block above, and for the same reason: a
+    // connect to a port nobody holds fails whether the namespace is isolated
+    // or not, so the supervisor binds REAL targets out here and passes their
+    // addresses in. The control proves each target is reachable without a
+    // sandbox first -- an attack that cannot succeed outside proves nothing
+    // inside.
+    if (host.net_namespaces) {
+        std::fprintf(stderr, "  the network namespace boundary:\n");
+
+        // a TCP listener on the host's loopback
+        int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        int on = 1;
+        ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+        sockaddr_in la{};
+        la.sin_family = AF_INET;
+        la.sin_port = 0;   // the kernel picks
+        la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bool have_tcp = lfd >= 0
+            && ::bind(lfd, reinterpret_cast<sockaddr*>(&la), sizeof la) == 0
+            && ::listen(lfd, 8) == 0;
+        std::uint16_t lport = 0;
+        if (have_tcp) {
+            socklen_t n = sizeof la;
+            ::getsockname(lfd, reinterpret_cast<sockaddr*>(&la), &n);
+            lport = ntohs(la.sin_port);
+        }
+
+        // a UDP echo on the host's loopback. The attack needs a REPLY to
+        // tell a real escape from a datagram vanishing into the guest's own
+        // loopback, so this forks a child that echoes one packet back.
+        int ufd_udp = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        sockaddr_in da{};
+        da.sin_family = AF_INET;
+        da.sin_port = 0;
+        da.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bool have_udp = ufd_udp >= 0
+            && ::bind(ufd_udp, reinterpret_cast<sockaddr*>(&da), sizeof da) == 0;
+        std::uint16_t uport = 0;
+        pid_t echo_pid = -1;
+        if (have_udp) {
+            socklen_t n = sizeof da;
+            ::getsockname(ufd_udp, reinterpret_cast<sockaddr*>(&da), &n);
+            uport = ntohs(da.sin_port);
+            echo_pid = ::fork();
+            if (echo_pid == 0) {
+                // the echo: answer whatever arrives, for as long as the test runs
+                for (;;) {
+                    char b[64];
+                    sockaddr_in from{};
+                    socklen_t fl = sizeof from;
+                    const long got = ::recvfrom(ufd_udp, b, sizeof b, 0,
+                                                reinterpret_cast<sockaddr*>(&from), &fl);
+                    if (got < 0) ::_exit(0);
+                    ::sendto(ufd_udp, "pong", 4, 0,
+                             reinterpret_cast<sockaddr*>(&from), fl);
+                }
+            }
+        }
+
+        // a PATHNAME unix socket, which scoping does not cover
+        const std::string sock_path = std::string{dir} + "/clay-pathname-probe.sock";
+        ::unlink(sock_path.c_str());
+        int ufd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_un ua{};
+        ua.sun_family = AF_UNIX;
+        std::snprintf(ua.sun_path, sizeof ua.sun_path, "%s", sock_path.c_str());
+        bool have_unix = ufd >= 0
+            && ::bind(ufd, reinterpret_cast<sockaddr*>(&ua), sizeof ua) == 0
+            && ::listen(ufd, 8) == 0;
+
+        if (have_tcp) {
+            // control: reachable from out here.
+            int s = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            sockaddr_in d = la;
+            d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const int r = ::connect(s, reinterpret_cast<sockaddr*>(&d), sizeof d);
+            ::close(s);
+            std::fprintf(stderr, "    control: host loopback %s\n",
+                         r == 0 ? "reachable, as expected"
+                                : "UNREACHABLE -- test is broken");
+            CHECK_EQ(r, 0);
+        }
+
+        const std::string port_env = "CLAY_LOOPBACK_PROBE_PORT=" + std::to_string(lport);
+        const std::string udp_env = "CLAY_LOOPBACK_PROBE_PORT=" + std::to_string(uport);
+        const std::string sock_env = "CLAY_PATHNAME_SOCK=" + sock_path;
+
+        // The policy under test: network authority AND its own namespace,
+        // which is what agentty's default posture builds.
+        auto proxied = [&](std::uint16_t probe_port, const std::string& probe_sock) {
+            return Policy<Draft>{}
+                .ro_bind("/usr", "/usr")
+                .bind_try("/lib", "/lib")
+                .bind_try("/lib64", "/lib64")
+                .bind_try("/bin", "/bin")
+                .ro_bind(dir, "/app")
+                .tmpfs("/tmp", 64_MB)
+                .proc_fs("/proc")
+                .dev_fs("/dev")
+                .workdir("/")
+                .connect("", 0)
+                .private_netns()
+                .env("CLAY_LOOPBACK_PROBE_PORT", std::to_string(probe_port))
+                .env("CLAY_PATHNAME_SOCK", probe_sock)
+                .syscall_profile(profiles::compiler_with_network())
+                .memory(256_MB)
+                .processes(64)
+                .seal();
+        };
+
+        // Each case gets the env its target needs. The UDP one points at the
+        // echo port, not the TCP listener: a datagram to a TCP port is
+        // answered by nobody, which would read as "blocked" for the wrong
+        // reason.
+        struct Case { const char* name; std::uint16_t port; const char* sock; bool applicable; };
+        const Case cases[] = {
+            {"net.host_loopback", lport, nullptr, have_tcp},
+            {"net.host_loopback_udp", uport, nullptr, have_udp},
+            {"net.lan", 0, nullptr, true},
+            {"net.cloud_metadata", 0, nullptr, true},
+            {"net.pathname_unix", 0, sock_path.c_str(), have_unix},
+        };
+        for (const auto& c : cases) {
+            if (!c.applicable) {
+                std::fprintf(stderr, "    %-22s skipped (no target)\n", c.name);
+                continue;
+            }
+            const std::string env = c.sock
+                ? std::string{"CLAY_PATHNAME_SOCK="} + c.sock
+                : "CLAY_LOOPBACK_PROBE_PORT=" + std::to_string(c.port);
+            Outcome o = run_attack(proxied(c.port, c.sock ? c.sock : ""), inner,
+                                   c.name, false, env.c_str());
+            std::fprintf(stderr, "    %-22s %s\n", c.name,
+                         !o.started                        ? "DID NOT START"
+                         : o.code == attacks::kEscaped      ? "*** ESCAPED ***"
+                         : o.code == attacks::kNotApplicable ? "n/a"
+                                                            : "blocked");
+            CHECK(o.started);
+            CHECK(o.code != attacks::kEscaped);
+        }
+        if (echo_pid > 0) { ::kill(echo_pid, SIGKILL); int st = 0; ::waitpid(echo_pid, &st, 0); }
+        if (ufd_udp >= 0) ::close(ufd_udp);
+        if (lfd >= 0) ::close(lfd);
+        if (ufd >= 0) ::close(ufd);
+        ::unlink(sock_path.c_str());
+        std::fprintf(stderr, "\n");
+    } else {
+        std::fprintf(stderr, "  netns boundary: skipped, no network namespaces\n\n");
     }
 
 #else
