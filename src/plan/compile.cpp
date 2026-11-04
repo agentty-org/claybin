@@ -865,6 +865,13 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             report.record(CapId::mem_limit, Enforcement::strong, "cgroup2 memory.max");
         else
             report.record(CapId::mem_limit, Enforcement::partial, "rlimit-as");
+    } else if (!r.memory_high.is_unlimited() && have_cgroup && host.cgroup_memory) {
+        // A throttle, not a ceiling. `partial` is the honest word: the guest
+        // is slowed under reclaim pressure rather than stopped, so it cannot
+        // take the machine down but it is not bounded either. Saying `strong`
+        // here would be the report flattering the policy.
+        report.record(CapId::mem_limit, Enforcement::partial,
+                      "cgroup2 memory.high (throttle, no hard cap)");
     }
     if (!r.pids.is_unlimited()) {
         rlimit(kRlimitNproc, r.pids.value());
@@ -890,6 +897,15 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             // the cpu controller is frequently NOT delegated to user sessions,
             // so asking for a quota and getting nothing is common. say so.
             report.record(CapId::cpu_limit, Enforcement::none, "cpu controller not delegated");
+    } else if (!r.cpu_weight.is_unlimited() && have_cgroup && host.cgroup_cpu) {
+        // A weight is not a ceiling: on an idle machine the guest still gets
+        // every core. What it buys is that the guest LOSES under contention,
+        // so a 12-way build cannot make the desktop unusable. `partial` is
+        // the honest word for that, and it is the one cpu setting that is
+        // safe to default -- a quota slows a build even when nothing else
+        // wants the cpu.
+        report.record(CapId::cpu_limit, Enforcement::partial,
+                      "cgroup2 cpu.weight (priority, no quota)");
     }
 
     // wall-clock is not a kernel mechanism at all: it needs a supervisor with a

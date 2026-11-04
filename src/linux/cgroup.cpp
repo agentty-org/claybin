@@ -379,6 +379,14 @@ Result<Group> create(const Probe& pr, const ResourceLimits& limits,
         return write_file(g.path_ + "/" + file, buf);
     };
 
+    // memory.high is independent of memory.max: a throttle without a kill is
+    // a valid policy (and the only one it is safe to DEFAULT to), so it is
+    // written whether or not a hard cap was asked for.
+    if (pr.memory && !limits.memory_high.is_unlimited()) {
+        if (auto st = set("memory.high", limits.memory_high.value()); !st)
+            return std::unexpected(st.error());
+    }
+
     if (pr.memory && !limits.memory.is_unlimited()) {
         if (auto st = set("memory.max", limits.memory.value()); !st)
             return std::unexpected(st.error());

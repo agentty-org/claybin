@@ -200,6 +200,17 @@ using Nanos = Limit<NanosTag, std::uint64_t>;
 class ResourceLimits {
   public:
     Bytes memory{};
+    // the THROTTLE, as distinct from the kill above.
+    //
+    // memory.max is a hard ceiling: cross it and the kernel OOM-kills the
+    // guest. memory.high is reclaim pressure -- cross it and the guest is
+    // slowed down, hard, but nothing dies. that difference is what makes a
+    // DEFAULT possible: picking a hard cap for someone else's machine turns a
+    // working `cargo build` into a kill that looks like our fault, while a
+    // high mark only makes the pathological case crawl.
+    //
+    // both can be set; the kernel wants high < max.
+    Bytes memory_high{};
     Bytes memory_swap{};
     Count pids{};
     Count open_files{};
@@ -221,6 +232,7 @@ class ResourceLimits {
     static ResourceLimits nothing() {
         ResourceLimits r;
         r.memory = Bytes::nothing();
+        r.memory_high = Bytes::nothing();
         r.memory_swap = Bytes::nothing();
         r.pids = Count::nothing();
         r.open_files = Count::nothing();
@@ -239,6 +251,7 @@ class ResourceLimits {
     ResourceLimits meet(const ResourceLimits& o) const {
         ResourceLimits r;
         r.memory = memory.meet(o.memory);
+        r.memory_high = memory_high.meet(o.memory_high);
         r.memory_swap = memory_swap.meet(o.memory_swap);
         r.pids = pids.meet(o.pids);
         r.open_files = open_files.meet(o.open_files);
@@ -253,7 +266,8 @@ class ResourceLimits {
     }
 
     bool subsumes(const ResourceLimits& o) const {
-        return memory.subsumes(o.memory) && memory_swap.subsumes(o.memory_swap) &&
+        return memory.subsumes(o.memory) && memory_high.subsumes(o.memory_high)
+            && memory_swap.subsumes(o.memory_swap) &&
                pids.subsumes(o.pids) && open_files.subsumes(o.open_files) &&
                cpu_time.subsumes(o.cpu_time) && wall_clock.subsumes(o.wall_clock) &&
                cpu_weight.subsumes(o.cpu_weight) &&

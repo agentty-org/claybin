@@ -433,6 +433,12 @@ class Policy<Draft> {
         data_.resources.memory = b;
         return std::move(*this);
     }
+    // reclaim pressure rather than a kill: see ResourceLimits::memory_high.
+    // the one memory limit it is safe to apply without knowing the machine.
+    Policy&& memory_high(Bytes b) && {
+        data_.resources.memory_high = b;
+        return std::move(*this);
+    }
     Policy&& processes(std::uint64_t n) && {
         data_.resources.pids = Count{n};
         return std::move(*this);
@@ -449,6 +455,14 @@ class Policy<Draft> {
     // 200 = two cores' worth. this is the one that bounds a busy loop.
     Policy&& cpu_percent(std::uint64_t pct) && {
         data_.resources.cpu_quota_percent = Count{pct};
+        return std::move(*this);
+    }
+    // relative priority under contention (cgroup2 cpu.weight, 1-10000, the
+    // default being 100). NOT a ceiling: an idle machine still gives the
+    // guest every core. that is what makes it safe to default where a quota
+    // is not -- see the call site in agentty's build_policy.
+    Policy&& cpu_weight(std::uint64_t w) && {
+        data_.resources.cpu_weight = Count{w};
         return std::move(*this);
     }
     Policy&& wall_clock(Nanos n) && {
