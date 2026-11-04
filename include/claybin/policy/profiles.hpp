@@ -125,6 +125,18 @@ inline SyscallPolicy base() {
         107,  // geteuid
         108,  // getegid
         110,  // getppid
+        // capget READS the caller's capability sets. it grants nothing -- capSET
+        // is the one that changes them, and that stays denied.
+        //
+        // WHY IT IS HERE: node calls capget 15 times during startup, and
+        // without it V8 died before running a line of script with
+        // `Check failed: 12 == errno` -- an assertion that the call it just
+        // made should have set ENOMEM. a syscall handing back EPERM where the
+        // caller expected a different errno is exactly that shape, and the
+        // symptom (a fatal error naming no file and no line) points nowhere
+        // near the cause. found by strace-counting node's startup on the host
+        // and diffing against the profile.
+        125,  // capget
         158,  // arch_prctl
         186,  // gettid
         201,  // time
@@ -592,6 +604,7 @@ inline SyscallPolicy base() {
         175,  // geteuid
         177,  // getegid
         173,  // getppid
+        90,   // capget -- reads only; see the x86_64 table for why node needs it
         178,  // gettid
         98,   // futex
         123,  // sched_getaffinity
