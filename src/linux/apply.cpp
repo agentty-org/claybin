@@ -1324,7 +1324,14 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "setrlimit", 0);
                 struct rlimit64 {
                     std::uint64_t cur, max;
-                } rl{op.soft, op.hard};
+                } rl{op.soft, op.hard}, old{};
+                // a box can only tighten. asking for more than the inherited
+                // hard limit is EPERM, and the host's limit is already the
+                // stricter wall, so keep it (seen on a pi: nproc hard 3335).
+                if (sys(SYS_prlimit64, 0, op.resource, 0, reinterpret_cast<long>(&old)) == 0) {
+                    if (rl.max > old.max) rl.max = old.max;
+                    if (rl.cur > rl.max) rl.cur = rl.max;
+                }
                 if (sys(SYS_prlimit64, 0, op.resource, reinterpret_cast<long>(&rl), 0) < 0)
                     return die(Errc::permission_denied, "setrlimit", errno);
                 return true;

@@ -11,6 +11,7 @@
 #if defined(__linux__)
 #include <cerrno>
 #include <cstdlib>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -217,6 +218,43 @@ int main(int argc, char** argv) {
                 CHECK(stopped);
             }
         }
+    }
+
+    // -- a cap above the inherited hard limit still spawns ------------------
+    // a pi had nproc hard=3335 and agentty asks for 4096. raising a hard limit
+    // is EPERM, so every spawn died. the host's lower limit should just win.
+    {
+        pid_t kid = ::fork();
+        if (kid == 0) {
+            struct rlimit cur{};
+            ::getrlimit(RLIMIT_NPROC, &cur);
+            // nproc counts every process of this user, so leave headroom
+            // above what is running, but stay under the 4096 we ask for.
+            struct rlimit low{4000, 4000};
+            if (cur.rlim_max != RLIM_INFINITY && cur.rlim_max < 4000) low = cur;
+            if (::setrlimit(RLIMIT_NPROC, &low) != 0) ::_exit(0);  // can't set up, skip
+            auto pol = shapes::system_ro().processes(4096)
+                           .syscall_profile(profiles::compiler()).seal();
+            auto c = compile(pol, host);
+            if (!c) ::_exit(2);
+            const char* argvv[] = {"/bin/true", nullptr};
+            Command cmd{"/bin/true", argvv, nullptr};
+            auto sp = c->cgroup.valid() ? spawn_in(c->plan, cmd, c->cgroup) : spawn(c->plan, cmd);
+            if (!sp) {
+                std::fprintf(stderr, "  spawn: %.*s errno=%d\n",
+                             static_cast<int>(sp.error().mechanism.size()),
+                             sp.error().mechanism.data(), sp.error().sys_errno);
+                ::_exit(3);
+            }
+            int st = 0;
+            ::waitpid(sp->pid, &st, 0);
+            ::_exit(WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 4);
+        }
+        int st = 0;
+        ::waitpid(kid, &st, 0);
+        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0))
+            std::fprintf(stderr, "  RLIMIT ABOVE HARD FAILS SPAWN: %d\n", WEXITSTATUS(st));
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     }
 
     // -- the cgroup is cleaned up ------------------------------------------
