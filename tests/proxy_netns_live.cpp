@@ -85,16 +85,27 @@ int main(int argc, char** argv) {
     constexpr const char* kGuestPath = "/tmp/clay-proxy-guest";
 
     // a box with network authority AND its own namespace, plus the listener.
+    // the ELF interpreter is /lib64/ld-linux-x86-64.so.2, and on a merged-/usr
+    // distro /lib, /lib64 and /bin are symlinks. Their TARGETS differ by
+    // distro (Ubuntu: /lib64 -> usr/lib64, Arch: /lib64 -> usr/lib), so mirror
+    // the host's own links; a guessed target leaves no interpreter and execve
+    // fails with ENOENT.
+    auto host_link = [](const char* p, const char* fallback) {
+        char t[4096];
+        const ssize_t n = ::readlink(p, t, sizeof t - 1);
+        if (n <= 0) return std::string{fallback};
+        return std::string{t, static_cast<std::size_t>(n)};
+    };
+    const std::string lib_t   = host_link("/lib", "usr/lib");
+    const std::string lib64_t = host_link("/lib64", "usr/lib64");
+    const std::string bin_t   = host_link("/bin", "usr/bin");
     auto pol = Policy<Draft>{}
                    .read("/usr")
                    .execute("/usr")
                    .ro_bind("/usr", "/usr")
-                   // the ELF interpreter is /lib64/ld-linux-x86-64.so.2, and on
-                   // a merged-/usr distro /lib and /lib64 are symlinks. the box
-                   // gets the same ones or nothing dynamic can start.
-                   .symlink("usr/lib", "/lib")
-                   .symlink("usr/lib", "/lib64")
-                   .symlink("usr/bin", "/bin")
+                   .symlink(lib_t, "/lib")
+                   .symlink(lib64_t, "/lib64")
+                   .symlink(bin_t, "/bin")
                    .proc_fs("/proc")
                    .dev_fs("/dev")
                    .tmpfs("/tmp", Bytes{16ull << 20})
