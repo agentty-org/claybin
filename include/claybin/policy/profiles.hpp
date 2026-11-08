@@ -59,6 +59,25 @@ inline constexpr std::uint32_t kPrctlAllowed[] = {
 // personality(0xffffffff) only reads the current value; 0 is PER_LINUX.
 inline constexpr std::uint32_t kPersonalityAllowed[] = {0u, 0xffffffffu};
 
+// A tracer (linuxity, an emulator) stacks its own filter to choose which
+// calls it traps; without one it stops on every syscall, about ten times
+// slower. Stacking can't widen anything, since the kernel runs every filter
+// and keeps the strictest answer, and a notify listener only sees the
+// installer's own descendants, all inside the sandbox. Only the ops that
+// install or query a filter. And since the strictest answer wins, a call
+// this policy kills would kill a guest the tracer meant to answer: under a
+// tracer those become EPERM, which refuses them just as firmly.
+inline void allow_stacked_filter(SyscallPolicy& p, SysNr seccomp_nr) {
+    static constexpr std::uint32_t kOps[] = {1 /* SET_MODE_FILTER */, 2 /* GET_ACTION_AVAIL */,
+                                             3 /* GET_NOTIF_SIZES */};
+    p.allow(seccomp_nr);
+    p.allow_arg32_only(seccomp_nr, 0, kOps);
+    std::vector<SysNr> killed;
+    for (const auto& r : p.rules())
+        if (r.action == SysAction::kill_process) killed.push_back(r.nr);
+    for (SysNr nr : killed) p.deny(nr, 1 /* EPERM */);
+}
+
 #if defined(CLAY_PROFILES_X86_64)
 
 // the bare minimum for a dynamically linked program to start, run, and exit.
@@ -522,8 +541,21 @@ inline SyscallPolicy compiler() {
 // same ptrace access check.
 inline SyscallPolicy supervisor() {
     SyscallPolicy p = compiler();
-    for (SysNr nr : {101u /* ptrace */, 310u /* process_vm_readv */, 311u /* process_vm_writev */})
+    for (SysNr nr : {101u /* ptrace */, 310u /* process_vm_readv */, 311u /* process_vm_writev */,
+                     // kill and tgkill are allowed already; these reach the
+                     // same targets. A tracer's child stops itself with one
+                     // before its first exec.
+                     200u /* tkill */, 129u /* rt_sigqueueinfo */, 297u /* rt_tgsigqueueinfo */,
+                     // a tracer emulates these for its guest (linuxity's root
+                     // chowns and setgroups). Allowing them grants nothing:
+                     // with the bounding set empty and no_new_privs, the
+                     // kernel's own credential checks refuse any real change.
+                     92u /* chown */, 93u /* fchown */, 94u /* lchown */, 116u /* setgroups */,
+                     105u /* setuid */, 106u /* setgid */, 113u /* setreuid */, 114u /* setregid */,
+                     117u /* setresuid */, 119u /* setresgid */, 122u /* setfsuid */,
+                     123u /* setfsgid */, 126u /* capset */, 118u /* getresuid */, 120u /* getresgid */})
         p.allow(nr);
+    allow_stacked_filter(p, 317 /* seccomp */);
     return p;
 }
 
@@ -828,8 +860,14 @@ inline SyscallPolicy compiler() {
 // see the x86-64 supervisor()
 inline SyscallPolicy supervisor() {
     SyscallPolicy p = compiler();
-    for (SysNr nr : {117u /* ptrace */, 270u /* process_vm_readv */, 271u /* process_vm_writev */})
+    for (SysNr nr : {117u /* ptrace */, 270u /* process_vm_readv */, 271u /* process_vm_writev */,
+                     130u /* tkill */, 138u /* rt_sigqueueinfo */, 240u /* rt_tgsigqueueinfo */,
+                     55u /* fchown */, 159u /* setgroups */, 146u /* setuid */, 144u /* setgid */,
+                     145u /* setreuid */, 143u /* setregid */, 147u /* setresuid */,
+                     149u /* setresgid */, 151u /* setfsuid */, 152u /* setfsgid */, 91u /* capset */,
+                     148u /* getresuid */, 150u /* getresgid */})
         p.allow(nr);
+    allow_stacked_filter(p, 277 /* seccomp */);
     return p;
 }
 
