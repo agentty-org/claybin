@@ -9,8 +9,10 @@
 #if defined(__linux__)
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -45,6 +47,24 @@ std::uint32_t probe_landlock_abi() {
     // ENOSYS/EOPNOTSUPP when landlock is absent or disabled.
     long rc = ::syscall(444 /* landlock_create_ruleset */, nullptr, 0ul, 1u);
     if (rc <= 0) return 0;
+    // a version number is a claim, not a wall. an emulating kernel (linuxity
+    // on android) answers it and then enforces nothing, so restrict a child
+    // for real: a ruleset that handles READ_DIR with no rules must refuse "/".
+    const pid_t pid = ::fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        std::uint64_t handled = 1u << 3;   // LANDLOCK_ACCESS_FS_READ_DIR
+        const long fd = ::syscall(444, &handled, sizeof handled, 0u);
+        if (fd < 0) ::_exit(1);
+        if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) ::_exit(2);
+        if (::syscall(446 /* landlock_restrict_self */, fd, 0u) != 0) ::_exit(3);
+        const int d = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (d >= 0) ::_exit(4);
+        ::_exit(errno == EACCES ? 0 : 5);
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return 0;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 0;
     return static_cast<std::uint32_t>(rc);
 }
 
@@ -120,6 +140,66 @@ bool probe_userns() {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+// can we make a mount nobody else sees, and does read-only on it hold? the
+// old check was "/proc/self/ns/mnt exists and userns works", which an
+// emulator that accepts mount(2) as a no-op passes while every bind and
+// read-only remount does nothing. so do it: in a child, mount a tmpfs over a
+// scratch dir, write a file, remount read-only, expect EROFS. then the
+// parent must see the dir still empty.
+bool probe_mount_ns() {
+    char dir[] = "/tmp/.clay-probe-XXXXXX";
+    // no scratch dir means claybin could not stage a root here either
+    if (!::mkdtemp(dir)) return false;
+    char a[sizeof dir + 2], b[sizeof dir + 2];
+    std::snprintf(a, sizeof a, "%s/a", dir);
+    std::snprintf(b, sizeof b, "%s/b", dir);
+
+    const uid_t real_uid = ::getuid();   // before unshare, see probe_userns
+    const gid_t real_gid = ::getgid();
+    const bool as_root = ::geteuid() == 0;
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        if (::unshare(as_root ? CLONE_NEWNS : (CLONE_NEWUSER | CLONE_NEWNS)) != 0) ::_exit(1);
+        if (!as_root) {
+            int f = ::open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
+            if (f >= 0) {
+                ssize_t w = ::write(f, "deny", 4);
+                (void)w;
+                ::close(f);
+            }
+            // both maps: a file created with an unmapped gid is EOVERFLOW
+            const struct { const char* path; unsigned id; } maps[] = {
+                {"/proc/self/uid_map", real_uid}, {"/proc/self/gid_map", real_gid}};
+            for (const auto& m : maps) {
+                char line[64];
+                const int n = std::snprintf(line, sizeof line, "0 %u 1\n", m.id);
+                f = ::open(m.path, O_WRONLY | O_CLOEXEC);
+                if (f < 0 || ::write(f, line, static_cast<std::size_t>(n)) != n) ::_exit(2);
+                ::close(f);
+            }
+        }
+        if (::mount("none", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) ::_exit(3);
+        if (::mount("tmpfs", dir, "tmpfs", 0, nullptr) != 0) ::_exit(4);
+        int f = ::open(a, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        if (f < 0) ::_exit(5);
+        ::close(f);
+        if (::mount(nullptr, dir, nullptr, MS_REMOUNT | MS_BIND | MS_RDONLY, nullptr) != 0) ::_exit(6);
+        f = ::open(b, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        if (f >= 0) ::_exit(7);
+        ::_exit(errno == EROFS ? 0 : 8);
+    }
+    int status = 0;
+    const bool ran = pid > 0 && ::waitpid(pid, &status, 0) == pid &&
+                     WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    // the file the child wrote must not be here: the tmpfs was private
+    struct stat st {};
+    const bool leaked = ::lstat(a, &st) == 0 || ::lstat(b, &st) == 0;
+    ::unlink(a);
+    ::unlink(b);
+    ::rmdir(dir);
+    return ran && !leaked;
+}
+
 bool probe_cgroup2() {
     struct stat st {};
     return ::stat("/sys/fs/cgroup/cgroup.controllers", &st) == 0;
@@ -161,7 +241,7 @@ HostCapabilities probe_host() {
     // without one they need CAP_SYS_ADMIN, so the honest answer for an
     // unprivileged process is no.
     const bool ns_creatable = h.user_namespaces || ::geteuid() == 0;
-    h.mount_namespaces = ns_creatable && path_exists("/proc/self/ns/mnt");
+    h.mount_namespaces = ns_creatable && path_exists("/proc/self/ns/mnt") && probe_mount_ns();
     h.pid_namespaces = ns_creatable && path_exists("/proc/self/ns/pid");
     h.net_namespaces = ns_creatable && path_exists("/proc/self/ns/net");
     h.uts_namespaces = ns_creatable && path_exists("/proc/self/ns/uts");
