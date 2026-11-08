@@ -11,9 +11,11 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -140,6 +142,32 @@ bool probe_userns() {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+// in a forked child: unshare `flags`, adding a user namespace with our uid
+// and gid mapped when not root. ids must be read before the fork's unshare,
+// see probe_userns. false if any step is refused.
+bool enter_ns(int flags, uid_t uid, gid_t gid) {
+    const bool as_root = ::geteuid() == 0;
+    if (::unshare(as_root ? flags : (CLONE_NEWUSER | flags)) != 0) return false;
+    if (as_root) return true;
+    int f = ::open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
+    if (f >= 0) {
+        ssize_t w = ::write(f, "deny", 4);
+        (void)w;
+        ::close(f);
+    }
+    // both maps: a file created with an unmapped gid is EOVERFLOW
+    const struct { const char* path; unsigned id; } maps[] = {
+        {"/proc/self/uid_map", uid}, {"/proc/self/gid_map", gid}};
+    for (const auto& m : maps) {
+        char line[64];
+        const int n = std::snprintf(line, sizeof line, "0 %u 1\n", m.id);
+        f = ::open(m.path, O_WRONLY | O_CLOEXEC);
+        if (f < 0 || ::write(f, line, static_cast<std::size_t>(n)) != n) return false;
+        ::close(f);
+    }
+    return true;
+}
+
 // can we make a mount nobody else sees, and does read-only on it hold? the
 // old check was "/proc/self/ns/mnt exists and userns works", which an
 // emulator that accepts mount(2) as a no-op passes while every bind and
@@ -156,28 +184,9 @@ bool probe_mount_ns() {
 
     const uid_t real_uid = ::getuid();   // before unshare, see probe_userns
     const gid_t real_gid = ::getgid();
-    const bool as_root = ::geteuid() == 0;
     const pid_t pid = ::fork();
     if (pid == 0) {
-        if (::unshare(as_root ? CLONE_NEWNS : (CLONE_NEWUSER | CLONE_NEWNS)) != 0) ::_exit(1);
-        if (!as_root) {
-            int f = ::open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
-            if (f >= 0) {
-                ssize_t w = ::write(f, "deny", 4);
-                (void)w;
-                ::close(f);
-            }
-            // both maps: a file created with an unmapped gid is EOVERFLOW
-            const struct { const char* path; unsigned id; } maps[] = {
-                {"/proc/self/uid_map", real_uid}, {"/proc/self/gid_map", real_gid}};
-            for (const auto& m : maps) {
-                char line[64];
-                const int n = std::snprintf(line, sizeof line, "0 %u 1\n", m.id);
-                f = ::open(m.path, O_WRONLY | O_CLOEXEC);
-                if (f < 0 || ::write(f, line, static_cast<std::size_t>(n)) != n) ::_exit(2);
-                ::close(f);
-            }
-        }
+        if (!enter_ns(CLONE_NEWNS, real_uid, real_gid)) ::_exit(1);
         if (::mount("none", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) ::_exit(3);
         if (::mount("tmpfs", dir, "tmpfs", 0, nullptr) != 0) ::_exit(4);
         int f = ::open(a, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
@@ -198,6 +207,31 @@ bool probe_mount_ns() {
     ::unlink(b);
     ::rmdir(dir);
     return ran && !leaked;
+}
+
+// does a new network namespace really have no route out? an emulator can
+// accept unshare(CLONE_NEWNET) and leave the host's interfaces in place. a
+// UDP connect sends nothing, and in a fresh netns (lo down, no routes) it
+// must fail with ENETUNREACH.
+bool probe_net_ns() {
+    const uid_t real_uid = ::getuid();
+    const gid_t real_gid = ::getgid();
+    const pid_t pid = ::fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        if (!enter_ns(CLONE_NEWNET, real_uid, real_gid)) ::_exit(1);
+        const int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s < 0) ::_exit(2);
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(9);
+        to.sin_addr.s_addr = htonl(0xC0000201u);   // 192.0.2.1, TEST-NET-1
+        if (::connect(s, reinterpret_cast<const sockaddr*>(&to), sizeof to) == 0) ::_exit(3);
+        ::_exit(errno == ENETUNREACH ? 0 : 4);
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 bool probe_cgroup2() {
@@ -243,7 +277,7 @@ HostCapabilities probe_host() {
     const bool ns_creatable = h.user_namespaces || ::geteuid() == 0;
     h.mount_namespaces = ns_creatable && path_exists("/proc/self/ns/mnt") && probe_mount_ns();
     h.pid_namespaces = ns_creatable && path_exists("/proc/self/ns/pid");
-    h.net_namespaces = ns_creatable && path_exists("/proc/self/ns/net");
+    h.net_namespaces = ns_creatable && path_exists("/proc/self/ns/net") && probe_net_ns();
     h.uts_namespaces = ns_creatable && path_exists("/proc/self/ns/uts");
     h.ipc_namespaces = ns_creatable && path_exists("/proc/self/ns/ipc");
     h.cgroup_namespaces = ns_creatable && path_exists("/proc/self/ns/cgroup");
