@@ -513,6 +513,20 @@ inline SyscallPolicy compiler() {
     return p;
 }
 
+// compiler() plus ptrace, for a tracer that supervises its own children
+// (linuxity, gdb, strace). Safe for the same reasons the other walls hold:
+// the sandbox has its own pid namespace, so a tracee can only be another
+// sandboxed process, and since 4.8 seccomp checks a syscall again after a
+// tracer rewrites it, so tracing can't step around this filter.
+// process_vm_readv/writev are a tracer's memory window; they follow the
+// same ptrace access check.
+inline SyscallPolicy supervisor() {
+    SyscallPolicy p = compiler();
+    for (SysNr nr : {101u /* ptrace */, 310u /* process_vm_readv */, 311u /* process_vm_writev */})
+        p.allow(nr);
+    return p;
+}
+
 // base plus TCP client sockets.
 //
 // pair this with a per-port `connect()` grant: landlock (abi 4+) then mediates
@@ -811,6 +825,14 @@ inline SyscallPolicy compiler() {
     return p;
 }
 
+// see the x86-64 supervisor()
+inline SyscallPolicy supervisor() {
+    SyscallPolicy p = compiler();
+    for (SysNr nr : {117u /* ptrace */, 270u /* process_vm_readv */, 271u /* process_vm_writev */})
+        p.allow(nr);
+    return p;
+}
+
 inline SyscallPolicy with_network() {
     SyscallPolicy p = base();
     static constexpr SysNr kNet[] = {
@@ -851,6 +873,7 @@ inline SyscallPolicy base() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy with_processes() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy with_filesystem() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy compiler() { return SyscallPolicy::nothing(); }
+inline SyscallPolicy supervisor() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy with_network() { return SyscallPolicy::nothing(); }
 inline SyscallPolicy compiler_with_network() { return SyscallPolicy::nothing(); }
 

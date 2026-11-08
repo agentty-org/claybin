@@ -935,6 +935,8 @@ int main(int argc, char** argv) {
         sys = profiles::compiler();
     else if (std::strcmp(profile_name, "compiler-net") == 0)
         sys = profiles::compiler_with_network();
+    else if (std::strcmp(profile_name, "supervisor") == 0)
+        sys = profiles::supervisor();
     else {
         std::fprintf(stderr, "claybin-run: --profile: unknown profile '%s' "
                              "(want base, proc, fs, net, compiler or compiler-net)\n",

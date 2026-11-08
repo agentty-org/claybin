@@ -140,6 +140,14 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
     out.push_back(ret(kRetKillProcess));
     out.push_back(ld_abs(kOffNr));
 
+    // nr == -1 is a syscall a tracer cancelled (gdb, strace -e inject,
+    // linuxity): the kernel skips it and runs nothing. Since 4.8 seccomp sees
+    // it again after the tracer's change, and the x32 guard below would kill
+    // the task for it, so a sandboxed debugger or emulator died on its first
+    // cancelled call.
+    out.push_back(jeq(0xffffffffu, 0, 1));
+    out.push_back(ret(kRetAllow));
+
     if (arch == kAuditArchX86_64) {
         // reject the x32 range outright rather than trying to reason about it.
         out.push_back(jge(kX32SyscallBit, 0, 1));
