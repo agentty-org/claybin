@@ -14,7 +14,10 @@ inline SyscallPolicy base() {
         20, 24, 47, 49, 50, 64, // pid/uid/gid/euid/egid/ppid
         199, 200, 201, 202, // 32-bit uid/gid variants
         33,  // access
+        13, 27, 104, 105, // time,alarm,setitimer,getitimer
+        29,  // pause
         43,  // times
+        57, 65, 66, 132, 147, // setpgid,getpgrp,setsid,getpgid,getsid
         45,  // brk
         54, 55, 221, // ioctl, fcntl, fcntl64
         77, 78, // getrusage,gettimeofday
@@ -93,9 +96,10 @@ inline SyscallPolicy compiler() {
 
 inline SyscallPolicy compiler_with_network() {
     auto p = compiler();
-    // socketcall multiplexes only socket operations. Network authority remains
-    // enforced by the same namespace/Landlock boundaries as the native profile.
-    p.allow(102);
+    // socketcall's pointer arguments cannot be checked for an allowed address
+    // family. Use the direct i386 socket syscalls instead, matching native
+    // argument filtering; old multiplexed socket creation stays fail-closed.
+    p.deny(102, 38);
     static constexpr SysNr calls[] = {
         345,337, // sendmmsg,recvmmsg
         359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,

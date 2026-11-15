@@ -653,7 +653,9 @@ class Policy<Sealed> {
         d.net = NetAuthority::everything();
         d.resources = ResourceLimits::everything();
         d.syscalls = SyscallPolicy::everything();
+#if defined(__x86_64__)
         d.syscalls_i386 = SyscallPolicy::everything();
+#endif
         d.proc = ProcOps::everything();
         d.isolation = Isolation::process;
         d.env_cleared = false;

@@ -47,6 +47,14 @@ int main() {
         CHECK(prog.has_value());
         if (prog) {
             CHECK_EQ(evaluate(*prog, 11, kAuditArchI386), kRetAllow); // execve
+            for (auto nr : {13u, 27u, 104u, 105u, 29u, 57u, 65u, 66u, 132u, 147u})
+                CHECK_EQ(evaluate(*prog, nr, kAuditArchI386), kRetAllow);
+            CHECK_EQ(evaluate(*prog, 3, 0u), kRetKillProcess); // unknown audit arch
+            // Upstream's tracer-cancelled syscall exception applies only after
+            // architecture validation, and must survive multi-ABI dispatch.
+            CHECK_EQ(evaluate(*prog, 0xffffffffu, kAuditArchX86_64), kRetAllow);
+            CHECK_EQ(evaluate(*prog, 0xffffffffu, kAuditArchI386), kRetAllow);
+            CHECK_EQ(evaluate(*prog, 0xffffffffu, 0u), kRetKillProcess);
             CHECK_EQ(evaluate(*prog, 59, kAuditArchI386), kRetErrno | 1u);
             CHECK_EQ(evaluate(*prog, 59, kAuditArchX86_64), kRetAllow);
             CHECK_EQ(evaluate(*prog, 11, kAuditArchAarch64), kRetKillProcess);
@@ -81,7 +89,14 @@ int main() {
         compat.notify(3);
         CHECK(!compile(native, std::optional{compat}, kAuditArchX86_64));
         auto network = profiles_i386::compiler_with_network();
-        CHECK_EQ(network.action_for(102), SysAction::allow);
+        CHECK_EQ(network.action_for(102), SysAction::errno_);
+        CHECK_EQ(network.errno_for(102), std::uint16_t{38});
+        auto network_prog = compile(native, std::optional{network}, kAuditArchX86_64);
+        CHECK(network_prog.has_value());
+        if (network_prog) {
+            CHECK_EQ(evaluate(*network_prog, 102, kAuditArchI386), kRetErrno | 38u);
+            CHECK_EQ(evaluate(*network_prog, 359, kAuditArchI386), kRetAllow); // socket
+        }
         PolicyData a, b;
         a.syscalls_i386 = profiles_i386::compiler();
         CHECK(a.subsumes(b));
