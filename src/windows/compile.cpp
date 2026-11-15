@@ -203,30 +203,30 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
           // past the policy-vocabulary roots: native forms only, with the
           // drive prefix already stripped above. anything else starting with
           // "/" failed the root table and never reaches here.
-          std::string out;
-          out.reserve(s.size());
+          std::string native;
+          native.reserve(s.size());
           bool prev_sep = false;
           for (const char c : s) {
               if (c == '/' || c == '\\') {
-                  if (!prev_sep && !out.empty()) out.push_back('\\');
+                  if (!prev_sep && !native.empty()) native.push_back('\\');
                   prev_sep = true;
               } else {
-                  out.push_back(c);
+                  native.push_back(c);
                   prev_sep = false;
               }
           }
-          while (!out.empty() && out.back() == '\\') out.pop_back();
-          if (out.empty())
+          while (!native.empty() && native.back() == '\\') native.pop_back();
+          if (native.empty())
               return std::unexpected(Error{Errc::invalid_policy, "path normalizes to nothing"});
 
-          const bool drive = out.size() >= 2 && out[1] == ':' &&
-                             ((out[0] >= 'A' && out[0] <= 'Z') ||
-                              (out[0] >= 'a' && out[0] <= 'z'));
-          const bool unc = out.size() >= 2 && out[0] == '\\' && out[1] == '\\';
+          const bool drive = native.size() >= 2 && native[1] == ':' &&
+                             ((native[0] >= 'A' && native[0] <= 'Z') ||
+                              (native[0] >= 'a' && native[0] <= 'z'));
+          const bool unc = native.size() >= 2 && native[0] == '\\' && native[1] == '\\';
           if (!drive && !unc)
               return std::unexpected(Error{Errc::invalid_policy,
                   "path has no drive prefix (need C:\\... or \\\\server\\\\share)"});
-          return out;
+          return native;
     };
 
     for (const auto& g : effective.grants()) {

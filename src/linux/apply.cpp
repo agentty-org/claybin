@@ -1441,8 +1441,8 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                     if (nf > 0) {
                         buf[nf] = '\0';
                         std::uint64_t ino = 0;
-                        for (const char* p = buf; *p; ++p)
-                            if (*p >= '0' && *p <= '9') ino = ino * 10 + std::uint64_t(*p - '0');
+                        for (const char* d = buf; *d; ++d)
+                            if (*d >= '0' && *d <= '9') ino = ino * 10 + std::uint64_t(*d - '0');
                         fds.proxy_netns_ino = ino;
                     }
                 }
