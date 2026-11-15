@@ -7,6 +7,8 @@
 
 #include "claybin/bpf/emit.hpp"
 #include "claybin/policy/profiles.hpp"
+#include "claybin/policy/profiles_i386.hpp"
+#include "claybin/policy/policy.hpp"
 
 using namespace clay;
 using namespace clay::bpf;
@@ -25,7 +27,7 @@ void differential(const SyscallPolicy& p, std::uint32_t max_nr = 600) {
     if (!prog) return;
     for (SysNr nr = 0; nr < max_nr; ++nr) {
         std::uint32_t got = evaluate(*prog, nr, kAuditArchX86_64);
-        std::uint32_t want = reference(p, nr);
+        std::uint32_t want = nr >= 512 && nr <= 547 ? kRetKillProcess : reference(p, nr);
         if (got != want) {
             std::fprintf(stderr, "  nr=%u got=%#x want=%#x\n", nr, got, want);
             CHECK_EQ(got, want);
@@ -38,6 +40,58 @@ void differential(const SyscallPolicy& p, std::uint32_t max_nr = 600) {
 }  // namespace
 
 int main() {
+    {
+        auto native = SyscallPolicy::everything();
+        auto compat = profiles_i386::compiler();
+        auto prog = compile(native, std::optional{compat}, kAuditArchX86_64);
+        CHECK(prog.has_value());
+        if (prog) {
+            CHECK_EQ(evaluate(*prog, 11, kAuditArchI386), kRetAllow); // execve
+            CHECK_EQ(evaluate(*prog, 59, kAuditArchI386), kRetErrno | 1u);
+            CHECK_EQ(evaluate(*prog, 59, kAuditArchX86_64), kRetAllow);
+            CHECK_EQ(evaluate(*prog, 11, kAuditArchAarch64), kRetKillProcess);
+            for (auto nr : {512u, 513u, 547u, 0x40000000u, 0x40000200u})
+                CHECK_EQ(evaluate(*prog, nr, kAuditArchX86_64), kRetKillProcess);
+            for (auto nr : {511u, 548u})
+                CHECK_EQ(evaluate(*prog, nr, kAuditArchX86_64), kRetAllow);
+            CHECK_EQ(evaluate(*prog, 0x40000003u, kAuditArchI386), kRetKillProcess);
+            CHECK_EQ(evaluate(*prog, 90, kAuditArchI386), kRetErrno | 38u);
+            for (auto nr : {192u,125u,380u}) {
+                std::uint64_t args[6]{};
+                args[2] = 6;
+                CHECK_EQ(evaluate_with_args(*prog, nr, kAuditArchI386, args), kRetErrno | 1u);
+                args[2] = 5;
+                CHECK_EQ(evaluate_with_args(*prog, nr, kAuditArchI386, args), kRetAllow);
+            }
+            std::uint64_t args[6]{0x10000000u};
+            CHECK_EQ(evaluate_with_args(*prog, 120, kAuditArchI386, args), kRetErrno | 1u);
+            args[0] = 0x100;
+            CHECK_EQ(evaluate_with_args(*prog, 120, kAuditArchI386, args), kRetAllow);
+            CHECK_EQ(evaluate(*prog, 37, kAuditArchI386), kRetErrno | 1u); // kill
+            CHECK_EQ(evaluate(*prog, 26, kAuditArchI386), kRetKillProcess); // ptrace
+            CHECK_EQ(evaluate(*prog, 288, kAuditArchI386), kRetKillProcess); // keyctl
+            args[1] = 0x100005401ull; // ioctl ignores upper register bits
+            CHECK_EQ(evaluate_with_args(*prog, 54, kAuditArchI386, args), kRetAllow);
+            args[1] = 0x5412; // TIOCSTI
+            CHECK_EQ(evaluate_with_args(*prog, 54, kAuditArchI386, args), kRetErrno | 1u);
+        }
+        auto only_native = compile(native, std::optional<SyscallPolicy>{}, kAuditArchX86_64);
+        CHECK(only_native.has_value());
+        CHECK_EQ(evaluate(*only_native, 11, kAuditArchI386), kRetKillProcess);
+        compat.notify(3);
+        CHECK(!compile(native, std::optional{compat}, kAuditArchX86_64));
+        auto network = profiles_i386::compiler_with_network();
+        CHECK_EQ(network.action_for(102), SysAction::allow);
+        PolicyData a, b;
+        a.syscalls_i386 = profiles_i386::compiler();
+        CHECK(a.subsumes(b));
+        CHECK(!b.subsumes(a));
+        CHECK(!a.meet(b).syscalls_i386);
+        CHECK(!b.meet(a).syscalls_i386);
+        b.syscalls_i386 = SyscallPolicy::everything();
+        CHECK(b.subsumes(a));
+        CHECK(a.meet(b).syscalls_i386.has_value());
+    }
     // -- arch guard --------------------------------------------------------
     {
         SyscallPolicy p;

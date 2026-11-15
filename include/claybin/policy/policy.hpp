@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,8 @@ struct PolicyData {
     NetAuthority net{};
     ResourceLimits resources{};
     SyscallPolicy syscalls{};
+    // Absent means the i386 ABI is killed, never inferred from native numbers.
+    std::optional<SyscallPolicy> syscalls_i386{};
     ProcOps proc{};
     Isolation isolation{Isolation::process};
 
@@ -182,6 +185,8 @@ struct PolicyData {
         r.net = net.meet(o.net);
         r.resources = resources.meet(o.resources);
         r.syscalls = syscalls.meet(o.syscalls);
+        if (syscalls_i386 && o.syscalls_i386)
+            r.syscalls_i386 = syscalls_i386->meet(*o.syscalls_i386);
         r.proc = proc.meet(o.proc);
         // stronger isolation wins, and stronger is the larger enum value.
         r.isolation = isolation > o.isolation ? isolation : o.isolation;
@@ -233,7 +238,9 @@ struct PolicyData {
 
     bool subsumes(const PolicyData& o) const {
         return fs.subsumes(o.fs) && net.subsumes(o.net) && resources.subsumes(o.resources) &&
-               syscalls.subsumes(o.syscalls) && proc.subsumes(o.proc) &&
+               syscalls.subsumes(o.syscalls) &&
+               (!o.syscalls_i386 || (syscalls_i386 && syscalls_i386->subsumes(*o.syscalls_i386))) &&
+               proc.subsumes(o.proc) &&
                keep_caps.subsumes(o.keep_caps) && isolation <= o.isolation;
     }
 
@@ -475,6 +482,10 @@ class Policy<Draft> {
         data_.syscalls = std::move(p);
         return std::move(*this);
     }
+    Policy&& syscall_profile_i386(SyscallPolicy p) && {
+        data_.syscalls_i386 = std::move(p);
+        return std::move(*this);
+    }
 
     // -- process ------------------------------------------------------------
     Policy&& allow_fork() && {
@@ -642,6 +653,7 @@ class Policy<Sealed> {
         d.net = NetAuthority::everything();
         d.resources = ResourceLimits::everything();
         d.syscalls = SyscallPolicy::everything();
+        d.syscalls_i386 = SyscallPolicy::everything();
         d.proc = ProcOps::everything();
         d.isolation = Isolation::process;
         d.env_cleared = false;

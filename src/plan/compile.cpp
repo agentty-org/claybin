@@ -1239,7 +1239,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // grant: it has no descriptor to send on once the handshake fd is closed.
         if (wants_notify) sys.allow(46 /* sendmsg */);
 
-        auto prog = bpf::compile(sys);
+        auto prog = bpf::compile(sys, d.syscalls_i386);
         if (!prog) return std::unexpected(prog.error());
 
         auto blob = std::span<const std::byte>{
