@@ -318,6 +318,41 @@ inline SyscallPolicy base() {
         // with the W^X rule below -- that rule still applies to the mapping,
         // which is where the protection actually lives.
         319,  // memfd_create
+        // No authority: the caller's own signal stack, scheduler state, ids.
+        // Rust and Go install an alternate signal stack in every thread to
+        // report stack overflows; EPERM aborts them at startup.
+        131,  // sigaltstack
+        143,  // sched_getparam
+        145,  // sched_getscheduler
+        118,  // getresuid   (the ids are in /proc/self/status already)
+        120,  // getresgid
+        // a private notification object, like timerfd_create above, which
+        // was allowed without the call that arms it. every libuv/glib loop
+        // arms its timerfd; without this node's timers never fire.
+        286,  // timerfd_settime
+        287,  // timerfd_gettime
+        // epoll_wait with a nanosecond timeout. same authority as
+        // epoll_pwait; new libuv probes it first.
+        441,  // epoll_pwait2
+        // closes the caller's OWN descriptors. python's subprocess and
+        // glibc's posix_spawn call it in every child before exec.
+        436,  // close_range
+        // the caller's file creation mask. per-process state, no reach;
+        // every shell runs `umask` and denying it makes every file 0666.
+        95,   // umask
+        // the kernel itself issues restart_syscall to resume a sleep a
+        // signal interrupted; denying it turns ^Z then fg into an error.
+        219,  // restart_syscall
+        // waiting for the caller's own signals and children. Rust's std and
+        // python's subprocess use waitid; shells use rt_sigsuspend for `wait`.
+        127,  // rt_sigpending
+        128,  // rt_sigtimedwait
+        130,  // rt_sigsuspend
+        34,   // pause
+        247,  // waitid
+        100,  // times
+        // the kernel checks ptrace access for another pid's list
+        274,  // get_robust_list
     };
     p.allow(std::span<const SysNr>{kOrdinary});
 
@@ -515,6 +550,30 @@ inline SyscallPolicy with_filesystem() {
                      285u /* fallocate */, 316u /* renameat2 */, 332u /* statx */,
                      439u /* faccessat2 */})
         p.allow(nr);
+    // Durability and copy calls on descriptors the caller already holds.
+    // They reach nothing the open that produced the fd didn't: the mount tree
+    // and landlock decided that. Without them the sandbox looks broken, not
+    // strict, measured: sqlite says "disk I/O error", git with
+    // core.fsync dies "fsync error ... Operation not permitted", `flock` and
+    // every lockfile tool fail, and python's shutil.copy falls back after
+    // copy_file_range EPERMs.
+    for (SysNr nr : {74u /* fsync */, 75u /* fdatasync */, 277u /* sync_file_range */,
+                     73u /* flock */, 221u /* fadvise64 */, 326u /* copy_file_range */,
+                     40u /* sendfile */, 275u /* splice */, 276u /* tee */,
+                     295u /* preadv */, 296u /* pwritev */, 327u /* preadv2 */,
+                     328u /* pwritev2 */, 26u /* msync */,
+                     // path calls the *at forms above already allow: creat is
+                     // open(O_CREAT|O_WRONLY|O_TRUNC), link is linkat, mkdirat
+                     // is mkdir. git links its object files into place.
+                     85u /* creat */, 86u /* link */, 258u /* mkdirat */,
+                     259u /* mknodat */, 268u /* fchmodat */, 452u /* fchmodat2 */,
+                     235u /* utimes */, 261u /* futimesat */, 132u /* utime */,
+                     // readlink's *at form; coreutils `readlink -f` uses it
+                     267u /* readlinkat */, 76u /* truncate */,
+                     // chown without CAP_CHOWN can only pick one of the
+                     // caller's own groups; fchownat is already allowed.
+                     92u /* chown */, 93u /* fchown */, 94u /* lchown */})
+        p.allow(nr);
     // read-only xattrs. coreutils `ls` and `cp -a` probe them per file
     // (security.selinux, system.posix_acl_access) and print an error on
     // EPERM. reading metadata grants nothing the mount tree and landlock
@@ -522,6 +581,13 @@ inline SyscallPolicy with_filesystem() {
     for (SysNr nr : {191u /* getxattr */, 192u /* lgetxattr */, 193u /* fgetxattr */,
                      194u /* listxattr */, 195u /* llistxattr */, 196u /* flistxattr */})
         p.allow(nr);
+    // xattr WRITES stay denied, but as ENOTSUP, not EPERM: `cp -a`, `tar -x`
+    // and rsync treat ENOTSUP as "this filesystem has no xattrs" and carry on,
+    // where EPERM makes each file an error.
+    for (SysNr nr : {188u /* setxattr */, 189u /* lsetxattr */, 190u /* fsetxattr */,
+                     197u /* removexattr */, 198u /* lremovexattr */,
+                     199u /* fremovexattr */})
+        p.deny(nr, 95 /* ENOTSUP */);
     return p;
 }
 

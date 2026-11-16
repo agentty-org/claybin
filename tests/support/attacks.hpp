@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #if defined(__linux__)
 #include <cerrno>
@@ -136,7 +137,10 @@ inline int kill_host_init() {
 }
 
 inline int fork_bomb() {
-    int made = 0;
+    // each child waits to be killed, so the count is live processes. it used
+    // to rely on pause() failing (EPERM under the old profile), which made
+    // every child exit at once and the test hang once pause() was allowed.
+    std::vector<pid_t> kids;
     for (int i = 0; i < 4096; ++i) {
         pid_t p = ::fork();
         if (p < 0) break;
@@ -144,9 +148,11 @@ inline int fork_bomb() {
             ::pause();
             ::_exit(0);
         }
-        ++made;
+        kids.push_back(p);
     }
-    for (int i = 0; i < made; ++i) ::wait(nullptr);
+    const int made = static_cast<int>(kids.size());
+    for (pid_t k : kids) ::kill(k, SIGKILL);
+    for (pid_t k : kids) ::waitpid(k, nullptr, 0);
     // if we got thousands of processes the pid limit is not working
     return made > 2000 ? kEscaped : kBlocked;
 }
