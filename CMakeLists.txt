@@ -194,6 +194,15 @@ if(CLAYBIN_TESTS)
   add_test(NAME aarch64_audit
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/aarch64_audit.sh
                    $<TARGET_FILE:clay_dump_aarch64>)
+  # the same independent check for x86_64 and i386, plus parity: the two
+  # ABIs' profiles must allow the same calls by name.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    add_executable(clay_dump_x86 tests/dump_x86.cpp)
+    target_link_libraries(clay_dump_x86 PRIVATE claybin)
+    add_test(NAME x86_audit
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/x86_audit.sh
+                     $<TARGET_FILE:clay_dump_x86>)
+  endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     claybin_test(escape_test)
     claybin_test(escape_corpus_test)

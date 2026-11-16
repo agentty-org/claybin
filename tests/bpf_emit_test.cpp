@@ -64,7 +64,7 @@ int main() {
                 CHECK_EQ(evaluate(*prog, nr, kAuditArchX86_64), kRetAllow);
             CHECK_EQ(evaluate(*prog, 0x40000003u, kAuditArchI386), kRetKillProcess);
             CHECK_EQ(evaluate(*prog, 90, kAuditArchI386), kRetErrno | 38u);
-            for (auto nr : {192u,125u,380u}) {
+            for (auto nr : {192u,125u}) {
                 std::uint64_t args[6]{};
                 args[2] = 6;
                 CHECK_EQ(evaluate_with_args(*prog, nr, kAuditArchI386, args), kRetErrno | 1u);
@@ -75,9 +75,10 @@ int main() {
             CHECK_EQ(evaluate_with_args(*prog, 120, kAuditArchI386, args), kRetErrno | 1u);
             args[0] = 0x100;
             CHECK_EQ(evaluate_with_args(*prog, 120, kAuditArchI386, args), kRetAllow);
-            CHECK_EQ(evaluate(*prog, 37, kAuditArchI386), kRetErrno | 1u); // kill
+            CHECK_EQ(evaluate(*prog, 37, kAuditArchI386), kRetAllow); // kill, as on x86_64
+            CHECK_EQ(evaluate(*prog, 380, kAuditArchI386), kRetErrno | 1u); // pkey_mprotect, as native
             CHECK_EQ(evaluate(*prog, 26, kAuditArchI386), kRetKillProcess); // ptrace
-            CHECK_EQ(evaluate(*prog, 288, kAuditArchI386), kRetKillProcess); // keyctl
+            CHECK_EQ(evaluate(*prog, 288, kAuditArchI386), kRetErrno | 1u); // keyctl: EPERM, as native
             args[1] = 0x100005401ull; // ioctl ignores upper register bits
             CHECK_EQ(evaluate_with_args(*prog, 54, kAuditArchI386, args), kRetAllow);
             args[1] = 0x5412; // TIOCSTI
@@ -86,8 +87,12 @@ int main() {
         auto only_native = compile(native, std::optional<SyscallPolicy>{}, kAuditArchX86_64);
         CHECK(only_native.has_value());
         CHECK_EQ(evaluate(*only_native, 11, kAuditArchI386), kRetKillProcess);
-        compat.notify(3);
-        CHECK(!compile(native, std::optional{compat}, kAuditArchX86_64));
+        // i386 rules may notify: broker::Request carries the arch.
+        compat.notify(37);
+        auto with_notify = compile(native, std::optional{compat}, kAuditArchX86_64);
+        CHECK(with_notify.has_value());
+        CHECK_EQ(evaluate(*with_notify, 37, kAuditArchI386), kRetUserNotif);
+        CHECK_EQ(evaluate(*with_notify, 37, kAuditArchX86_64) != kRetUserNotif, true);
         auto network = profiles_i386::compiler_with_network();
         CHECK_EQ(network.action_for(102), SysAction::errno_);
         CHECK_EQ(network.errno_for(102), std::uint16_t{38});
