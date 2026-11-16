@@ -1208,16 +1208,6 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // -- phase: seccomp (last wall) ---------------------------------------
     if (host.seccomp) {
         SyscallPolicy sys = d.syscalls;
-        if (d.syscalls_i386) {
-            const auto& compat = *d.syscalls_i386;
-            const auto notifies = [](const auto& rule) { return rule.action == SysAction::notify; };
-            if (compat.default_action() == SysAction::notify ||
-                std::any_of(compat.rules().begin(), compat.rules().end(), notifies) ||
-                std::any_of(compat.arg_rules().begin(), compat.arg_rules().end(), notifies) ||
-                std::any_of(compat.arg_allow_sets().begin(), compat.arg_allow_sets().end(), notifies))
-                return std::unexpected(Error{Errc::unsupported,
-                    "i386 seccomp notifications require an architecture-aware broker"});
-        }
         if (sys.default_action() == SysAction::kill_process && sys.rules().empty()) {
             // a policy that never named a syscall would kill the child before it
             // could exec. that is a policy bug, not something to paper over.
@@ -1226,9 +1216,23 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         }
         // does the policy delegate anything to a supervisor? if so the kernel
         // has to hand us a listener fd, which is a different install call.
+        // i386 rules count too: broker::Request carries the audit arch, so a
+        // supervisor can tell the two ABIs' numbers apart.
         bool wants_notify = sys.default_action() == SysAction::notify;
         for (const auto& rule : sys.rules())
             if (rule.action == SysAction::notify) wants_notify = true;
+        if (d.syscalls_i386) {
+            const auto& compat = *d.syscalls_i386;
+            const auto notifies = [](const auto& rule) { return rule.action == SysAction::notify; };
+            if (compat.default_action() == SysAction::notify ||
+                std::any_of(compat.rules().begin(), compat.rules().end(), notifies))
+                wants_notify = true;
+            // argument rules can't notify: the native emitter has no such path.
+            if (std::any_of(compat.arg_rules().begin(), compat.arg_rules().end(), notifies) ||
+                std::any_of(compat.arg_allow_sets().begin(), compat.arg_allow_sets().end(), notifies))
+                return std::unexpected(Error{Errc::unsupported,
+                    "i386 seccomp: argument rules cannot notify"});
+        }
 
         if (wants_notify && !host.seccomp_user_notif)
             return std::unexpected(Error{

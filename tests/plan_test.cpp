@@ -35,11 +35,12 @@ int main() {
             CHECK(mechanism.find("arch guard only") != std::string_view::npos);
         }
     }
-    // A native-only broker must never decode a compatibility syscall number.
+    // i386 notify rules compile (broker::Request carries the arch, so the
+    // supervisor can tell the ABIs apart). Argument rules can't notify.
     for (int kind : {0, 1, 2, 3}) {
         auto compat = profiles_i386::compiler();
         if (kind == 0) compat.set_default(SysAction::notify);
-        if (kind == 1) compat.set(26, SysAction::notify);
+        if (kind == 1) compat.set(37, SysAction::notify);
         if (kind == 2) compat.deny_arg_all(125, 2, 6, SysAction::notify);
         if (kind == 3) {
             static constexpr std::uint32_t allowed[] = {1};
@@ -47,7 +48,9 @@ int main() {
         }
         auto policy = Policy<Draft>{}.syscall_profile(profiles::compiler())
             .syscall_profile_i386(std::move(compat)).seal();
-        CHECK(!compile(policy, HostCapabilities::modern_linux()).has_value());
+        auto c = compile(policy, HostCapabilities::modern_linux());
+        CHECK_EQ(c.has_value(), kind <= 1);
+        if (c) CHECK(c->brokers_syscalls);
     }
 #endif
     // -- arena: refs resolve, strings are shared --------------------------

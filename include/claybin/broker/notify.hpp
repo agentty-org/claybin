@@ -86,6 +86,10 @@ struct Request {
     std::uint64_t id{0};      // the notification id, needed to respond
     std::uint32_t pid{0};     // the guest thread
     SysNr nr{0};              // which syscall
+    // the syscall's audit arch (AUDIT_ARCH_*). With a compatibility ABI
+    // enabled the same nr means different calls, so a supervisor must check
+    // this before reading `nr`.
+    std::uint32_t arch{0};
     std::uint64_t args[6]{};  // its register arguments, verbatim
 };
 

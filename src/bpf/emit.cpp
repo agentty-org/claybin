@@ -366,12 +366,8 @@ Result<Program> compile(const SyscallPolicy& native, const std::optional<Syscall
     if (!i386) return compile(native, arch);
     if (arch != kAuditArchX86_64)
         return std::unexpected(Error{Errc::unsupported, "seccomp: i386 requires x86_64 native ABI"});
-    if (i386->default_action() == SysAction::notify ||
-        std::any_of(i386->rules().begin(), i386->rules().end(),
-                    [](const auto& r) { return r.action == SysAction::notify; }) ||
-        std::any_of(i386->arg_rules().begin(), i386->arg_rules().end(),
-                    [](const auto& r) { return r.action == SysAction::notify; }))
-        return std::unexpected(Error{Errc::unsupported, "seccomp: i386 notification unsupported"});
+    // notify is fine here: a broker::Request carries the audit arch, so the
+    // supervisor can tell an i386 nr from the same native one.
     auto n = compile(native, arch);
     if (!n) return std::unexpected(n.error());
     auto c = compile(*i386, kAuditArchI386);

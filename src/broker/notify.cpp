@@ -99,6 +99,7 @@ Result<Request> Listener::next() {
     r.id = n.id;
     r.pid = n.pid;
     r.nr = static_cast<SysNr>(n.nr);
+    r.arch = n.arch;
     for (int i = 0; i < 6; ++i) r.args[i] = n.args[i];
     return r;
 }
