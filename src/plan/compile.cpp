@@ -1208,6 +1208,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // -- phase: seccomp (last wall) ---------------------------------------
     if (host.seccomp) {
         SyscallPolicy sys = d.syscalls;
+        if (d.syscalls_i386) {
+            const auto& compat = *d.syscalls_i386;
+            const auto notifies = [](const auto& rule) { return rule.action == SysAction::notify; };
+            if (compat.default_action() == SysAction::notify ||
+                std::any_of(compat.rules().begin(), compat.rules().end(), notifies) ||
+                std::any_of(compat.arg_rules().begin(), compat.arg_rules().end(), notifies) ||
+                std::any_of(compat.arg_allow_sets().begin(), compat.arg_allow_sets().end(), notifies))
+                return std::unexpected(Error{Errc::unsupported,
+                    "i386 seccomp notifications require an architecture-aware broker"});
+        }
         if (sys.default_action() == SysAction::kill_process && sys.rules().empty()) {
             // a policy that never named a syscall would kill the child before it
             // could exec. that is a policy bug, not something to paper over.
@@ -1239,7 +1249,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // grant: it has no descriptor to send on once the handshake fd is closed.
         if (wants_notify) sys.allow(46 /* sendmsg */);
 
-        auto prog = bpf::compile(sys);
+        auto prog = bpf::compile(sys, d.syscalls_i386);
         if (!prog) return std::unexpected(prog.error());
 
         auto blob = std::span<const std::byte>{
@@ -1259,12 +1269,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // compiled to SyscallPolicy::everything() and the report cheerfully
         // said `strong syscall.filter`, which would have put a green wall on
         // screen for a filter the user had just turned off.
-        if (sys.default_action() == SysAction::allow && sys.rules().empty() &&
-            sys.arg_rules().empty() && sys.arg_allow_sets().empty()) {
+        const auto unfiltered = [](const SyscallPolicy& p) {
+            return p.default_action() == SysAction::allow && p.rules().empty() &&
+                   p.arg_rules().empty() && p.arg_allow_sets().empty();
+        };
+        if (unfiltered(sys) || (d.syscalls_i386 && unfiltered(*d.syscalls_i386))) {
             report.record(CapId::syscall_filter, Enforcement::partial,
-                          "seccomp-bpf: arch guard only, all syscalls permitted");
+                          "seccomp-bpf: arch guard only for an enabled ABI, all its syscalls permitted");
         } else {
-            report.record(CapId::syscall_filter, Enforcement::strong, "seccomp-bpf");
+            report.record(CapId::syscall_filter, Enforcement::strong,
+                          d.syscalls_i386 ? "seccomp-bpf: x86_64+i386 (x32 denied)" : "seccomp-bpf");
         }
         out.brokers_syscalls = wants_notify;
     } else {

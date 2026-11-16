@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "claybin/core/error.hpp"
@@ -78,6 +79,7 @@ inline constexpr std::uint32_t kRetAllow = 0x7fff0000u;
 
 // audit arch tokens, needed for the arch guard.
 inline constexpr std::uint32_t kAuditArchX86_64 = 0xc000003eu;
+inline constexpr std::uint32_t kAuditArchI386 = 0x40000003u;
 inline constexpr std::uint32_t kAuditArchAarch64 = 0xc00000b7u;
 inline constexpr std::uint32_t kAuditArchRiscv64 = 0xc00000f3u;
 
@@ -135,6 +137,11 @@ std::vector<Interval> fold_intervals(const SyscallPolicy& policy);
 // compile to a BPF program. fails rather than emitting something weaker than
 // asked for.
 Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch = native_arch());
+
+// Explicit compatibility policy: supported only with an x86_64 native policy.
+// No policy means the compatibility ABI is killed. i386 notification is unsupported.
+Result<Program> compile(const SyscallPolicy& native, const std::optional<SyscallPolicy>& i386,
+                        std::uint32_t arch = native_arch());
 
 // tiny reference interpreter over struct seccomp_data, used by tests to
 // differential-check the tree against a linear lookup. also handy for `explain`.

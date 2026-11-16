@@ -7,12 +7,49 @@
 #include "claybin/plan/compile.hpp"
 #include "claybin/plan/plan.hpp"
 #include "claybin/policy/profiles.hpp"
+#include "claybin/policy/profiles_i386.hpp"
 
 using namespace clay;
 using namespace clay::test;
 using namespace clay::literals;
 
 int main() {
+#if defined(__linux__) && defined(__x86_64__)
+    // An enabled, unfiltered compat ABI weakens even a filtered native policy.
+    for (bool compat_filtered : {false, true}) {
+        auto p = Policy<Draft>{}
+                     .syscall_profile(profiles::compiler())
+                     .syscall_profile_i386(compat_filtered ? profiles_i386::compiler()
+                                                          : SyscallPolicy::everything())
+                     .seal();
+        auto c = compile(p, HostCapabilities::modern_linux());
+        CHECK(c.has_value());
+        if (!c) continue;
+        CHECK_EQ(c->guarantees.strength(CapId::syscall_filter),
+                 compat_filtered ? Enforcement::strong : Enforcement::partial);
+        const std::string_view mechanism = c->guarantees.mechanism(CapId::syscall_filter);
+        if (compat_filtered) {
+            CHECK(mechanism.find("x86_64+i386") != std::string_view::npos);
+            CHECK(mechanism.find("x32 denied") != std::string_view::npos);
+        } else {
+            CHECK(mechanism.find("arch guard only") != std::string_view::npos);
+        }
+    }
+    // A native-only broker must never decode a compatibility syscall number.
+    for (int kind : {0, 1, 2, 3}) {
+        auto compat = profiles_i386::compiler();
+        if (kind == 0) compat.set_default(SysAction::notify);
+        if (kind == 1) compat.set(26, SysAction::notify);
+        if (kind == 2) compat.deny_arg_all(125, 2, 6, SysAction::notify);
+        if (kind == 3) {
+            static constexpr std::uint32_t allowed[] = {1};
+            compat.allow_arg32_only(999, 1, allowed, SysAction::notify);
+        }
+        auto policy = Policy<Draft>{}.syscall_profile(profiles::compiler())
+            .syscall_profile_i386(std::move(compat)).seal();
+        CHECK(!compile(policy, HostCapabilities::modern_linux()).has_value());
+    }
+#endif
     // -- arena: refs resolve, strings are shared --------------------------
     {
         PlanBuilder b;

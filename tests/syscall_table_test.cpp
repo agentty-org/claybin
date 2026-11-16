@@ -251,7 +251,10 @@ bool permitted(const SyscallPolicy& p, long nr) {
 
 }  // namespace
 
+namespace clay::test { void check_i386_table(); }
+
 int main() {
+    check_i386_table();
     // -- the syscalls a sandbox must never allow --------------------------
     //
     // spelled by NAME here, resolved through the kernel's headers. that is the
@@ -573,3 +576,6 @@ int main() {
 }
 
 #endif
+
+// Must follow native SYS_* uses: unistd_32 intentionally replaces __NR_*.
+#include "i386_table.hpp"

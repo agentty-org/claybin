@@ -148,9 +148,15 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
     out.push_back(jeq(0xffffffffu, 0, 1));
     out.push_back(ret(kRetAllow));
 
-    if (arch == kAuditArchX86_64) {
+    if (arch == kAuditArchX86_64 || arch == kAuditArchI386) {
         // reject the x32 range outright rather than trying to reason about it.
         out.push_back(jge(kX32SyscallBit, 0, 1));
+        out.push_back(ret(kRetKillProcess));
+    }
+    if (arch == kAuditArchX86_64) {
+        // Before Linux 5.4 these untagged numbers entered x32 handlers too.
+        out.push_back(jge(512, 0, 2));
+        out.push_back(jgt(547, 1, 0));
         out.push_back(ret(kRetKillProcess));
     }
 
@@ -353,6 +359,33 @@ Result<Program> compile(const SyscallPolicy& policy, std::uint32_t arch) {
         return std::unexpected(Error{Errc::too_many_rules, "seccomp: program too large"});
 
     return prog;
+}
+
+Result<Program> compile(const SyscallPolicy& native, const std::optional<SyscallPolicy>& i386,
+                        std::uint32_t arch) {
+    if (!i386) return compile(native, arch);
+    if (arch != kAuditArchX86_64)
+        return std::unexpected(Error{Errc::unsupported, "seccomp: i386 requires x86_64 native ABI"});
+    if (i386->default_action() == SysAction::notify ||
+        std::any_of(i386->rules().begin(), i386->rules().end(),
+                    [](const auto& r) { return r.action == SysAction::notify; }) ||
+        std::any_of(i386->arg_rules().begin(), i386->arg_rules().end(),
+                    [](const auto& r) { return r.action == SysAction::notify; }))
+        return std::unexpected(Error{Errc::unsupported, "seccomp: i386 notification unsupported"});
+    auto n = compile(native, arch);
+    if (!n) return std::unexpected(n.error());
+    auto c = compile(*i386, kAuditArchI386);
+    if (!c) return std::unexpected(c.error());
+    // Use long jumps: policy bodies routinely exceed conditional jump reach.
+    std::vector<Insn> out{ld_abs(kOffArch), jeq(arch, 0, 1), ja(3),
+                          jeq(kAuditArchI386, 1, 0), ret(kRetKillProcess),
+                          ja(static_cast<std::uint32_t>(n->insns.size()))};
+    out.insert(out.end(), n->insns.begin(), n->insns.end());
+    out.insert(out.end(), c->insns.begin(), c->insns.end());
+    if (out.size() > 4096)
+        return std::unexpected(Error{Errc::unsupported, "seccomp: combined filter too large"});
+    n->insns = std::move(out);
+    return n;
 }
 
 std::uint32_t evaluate(const Program& prog, std::uint32_t nr, std::uint32_t arch) {
