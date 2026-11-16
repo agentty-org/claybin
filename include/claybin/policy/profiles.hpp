@@ -353,8 +353,32 @@ inline SyscallPolicy base() {
         100,  // times
         // the kernel checks ptrace access for another pid's list
         274,  // get_robust_list
+        // file watching. a watch needs read access to the path, so it only
+        // sees what the mount tree and landlock already show. without it
+        // tsc --watch, vite, cargo watch and every IDE helper never fire.
+        253,  // inotify_init
+        294,  // inotify_init1
+        254,  // inotify_add_watch
+        255,  // inotify_rm_watch
+        // the caller's own pending signals, as a descriptor. libuv and
+        // systemd-style loops use it instead of a handler.
+        282,  // signalfd
+        289,  // signalfd4
+        // reading a niceness. setpriority is narrowed below.
+        140,  // getpriority
     };
     p.allow(std::span<const SysNr>{kOrdinary});
+
+    // setpriority (`nice`, make -l, cargo's jobserver) on the caller only:
+    // which == PRIO_PROCESS and who == 0. Without CAP_SYS_NICE it can only
+    // lower priority anyway, but PRIO_USER would reach every process of the
+    // user, outside the sandbox too when there's no pid namespace.
+    static constexpr std::uint32_t kZero[] = {0};
+    p.allow(141 /* setpriority */);
+    p.allow_arg32_only(141, 0 /* which */, std::span<const std::uint32_t>{kZero},
+                       SysAction::errno_, 1);
+    p.allow_arg32_only(141, 1 /* who */, std::span<const std::uint32_t>{kZero},
+                       SysAction::errno_, 1);
 
     // mlockall stays DENIED, and the asymmetry with mlock is the point.
     //

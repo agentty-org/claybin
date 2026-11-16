@@ -17,6 +17,7 @@
 #include <string_view>
 
 #include "claybin/policy/profiles.hpp"
+#include "claybin/bpf/emit.hpp"
 
 // the aarch64 tables, compiled for that arch in their own translation unit so
 // they can be checked here. see profiles_aarch64.cpp.
@@ -236,6 +237,31 @@ constexpr Named kExpected[] = {
     {"accept4", SYS_accept4},
     {"recvmmsg", SYS_recvmmsg},
     {"sendmmsg", SYS_sendmmsg},
+    // what real tools need (kToolsNeed below)
+    {"fsync", SYS_fsync},
+    {"fdatasync", SYS_fdatasync},
+    {"flock", SYS_flock},
+    {"copy_file_range", SYS_copy_file_range},
+    {"link", SYS_link},
+    {"creat", SYS_creat},
+    {"mkdirat", SYS_mkdirat},
+    {"umask", SYS_umask},
+    {"sigaltstack", SYS_sigaltstack},
+    {"waitid", SYS_waitid},
+    {"rt_sigsuspend", SYS_rt_sigsuspend},
+    {"pause", SYS_pause},
+    {"timerfd_settime", SYS_timerfd_settime},
+    {"epoll_pwait2", SYS_epoll_pwait2},
+    {"close_range", SYS_close_range},
+    {"getresuid", SYS_getresuid},
+    {"inotify_init1", SYS_inotify_init1},
+    {"inotify_add_watch", SYS_inotify_add_watch},
+    {"signalfd4", SYS_signalfd4},
+    {"getpriority", SYS_getpriority},
+    {"preadv", SYS_preadv},
+    {"pwritev", SYS_pwritev},
+    {"msync", SYS_msync},
+    {"setpriority", SYS_setpriority},
 };
 
 long nr_of(std::string_view name) {
@@ -346,6 +372,45 @@ int main() {
             CHECK(false);
         } else {
             ++g_checks;
+        }
+    }
+
+    // -- the syscalls real tools need, by name -------------------------------
+    //
+    // traced from git, python, sqlite, tar, make, gcc and node. each of these
+    // came back EPERM once and broke something visible: sqlite "disk I/O
+    // error", git's "fsync error", flock, tsc --watch, a Rust panic handler.
+    static constexpr const char* kToolsNeed[] = {
+        "fsync", "fdatasync", "flock", "copy_file_range", "link", "creat",
+        "mkdirat", "umask", "sigaltstack", "waitid", "rt_sigsuspend", "pause",
+        "timerfd_settime", "epoll_pwait2", "close_range", "getresuid",
+        "inotify_init1", "inotify_add_watch", "signalfd4", "getpriority",
+        "utimensat", "preadv", "pwritev", "msync",
+    };
+    for (const char* name : kToolsNeed) {
+        long nr = nr_of(name);
+        CHECK(nr >= 0);
+        if (nr < 0) continue;
+        if (!permitted(profiles::compiler(), nr)) {
+            std::fprintf(stderr, "  compiler() DENIES %s (nr %ld), which real tools need\n",
+                         name, nr);
+            CHECK(false);
+        } else {
+            ++g_checks;
+        }
+    }
+    // setpriority: allowed, but only on the caller (which=PRIO_PROCESS, who=0)
+    {
+        auto prog = bpf::compile(profiles::compiler());
+        CHECK(prog.has_value());
+        if (prog) {
+            const auto arch = bpf::native_arch();
+            std::uint64_t self[6]{0, 0, 5};
+            std::uint64_t other_pid[6]{0, 4242, 5};
+            std::uint64_t whole_user[6]{2 /* PRIO_USER */, 0, 5};
+            CHECK_EQ(bpf::evaluate_with_args(*prog, SYS_setpriority, arch, self), bpf::kRetAllow);
+            CHECK(bpf::evaluate_with_args(*prog, SYS_setpriority, arch, other_pid) != bpf::kRetAllow);
+            CHECK(bpf::evaluate_with_args(*prog, SYS_setpriority, arch, whole_user) != bpf::kRetAllow);
         }
     }
 

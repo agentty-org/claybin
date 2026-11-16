@@ -168,8 +168,24 @@ inline SyscallPolicy base() {
         60,   // umask
         // AF_UNIX pairs only; the family is checked in add_socket_families()
         360,  // socketpair
+        // file watching, signal descriptors, niceness: as profiles::base()
+        291,  // inotify_init
+        332,  // inotify_init1
+        292,  // inotify_add_watch
+        293,  // inotify_rm_watch
+        321,  // signalfd
+        327,  // signalfd4
+        96,   // getpriority
     };
     p.allow(std::span<const SysNr>{kAllowed});
+
+    // setpriority on the caller only, as profiles::base()
+    static constexpr std::uint32_t kZero[] = {0};
+    p.allow(97 /* setpriority */);
+    p.allow_arg32_only(97, 0 /* which */, std::span<const std::uint32_t>{kZero},
+                       SysAction::errno_, 1);
+    p.allow_arg32_only(97, 1 /* who */, std::span<const std::uint32_t>{kZero},
+                       SysAction::errno_, 1);
 
     // the old mmap takes its six arguments through a pointer, so seccomp
     // can't see prot and W^X couldn't hold. ENOSYS: libc uses mmap2.
