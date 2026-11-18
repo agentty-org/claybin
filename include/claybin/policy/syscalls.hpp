@@ -176,16 +176,19 @@ class SyscallPolicy {
     SyscallPolicy& notify(SysNr nr) { return set(nr, SysAction::notify); }
 
     SyscallPolicy& set(SysNr nr, SysAction a, std::uint16_t err = 1) {
-        for (auto& r : rules_) {
-            if (r.nr == nr) {
-                r.action = a;
-                r.errno_value = err;
-                return *this;
-            }
+        // rules_ is kept sorted by nr, so find-or-insert is one binary
+        // search. This used to linear-scan and then re-sort the WHOLE vector
+        // on every insert -- O(n^2 log n) over a ~350-syscall profile, built
+        // per spawn, ~8% of a sandboxed `true`.
+        const auto it = std::lower_bound(
+            rules_.begin(), rules_.end(), nr,
+            [](const SyscallRule& r, SysNr n) { return r.nr < n; });
+        if (it != rules_.end() && it->nr == nr) {
+            it->action = a;
+            it->errno_value = err;
+            return *this;
         }
-        rules_.push_back({nr, a, err});
-        std::sort(rules_.begin(), rules_.end(),
-                  [](const SyscallRule& x, const SyscallRule& y) { return x.nr < y.nr; });
+        rules_.insert(it, {nr, a, err});
         return *this;
     }
 
