@@ -145,6 +145,13 @@ enum class OpCode : std::uint16_t {
     // supervisor accepts on it from outside. apply() writes the fd and port
     // into ApplyFds.
     loopback_up,
+    // a landlock rule on the path ITSELF, never on what it points to: the path
+    // is opened O_PATH|O_NOFOLLOW. emitted only by mask expansion (see
+    // compile.cpp), which grants each sibling of a masked path individually.
+    // a sibling that is a symlink to ~/.ssh must not turn into a grant ON
+    // ~/.ssh, and following it would do exactly that, because landlock rules
+    // attach to the inode the fd names. same payload as landlock_rule.
+    landlock_rule_nofollow,
 };
 
 constexpr Phase phase_of(OpCode c) {
@@ -181,6 +188,7 @@ constexpr Phase phase_of(OpCode c) {
         case OpCode::set_rlimit:
         case OpCode::set_ids: return Phase::process;
         case OpCode::landlock_rule:
+        case OpCode::landlock_rule_nofollow:
         case OpCode::landlock_net_rule:
         case OpCode::landlock_enforce: return Phase::landlock;
         case OpCode::drop_caps:
@@ -218,6 +226,7 @@ constexpr const char* to_string(OpCode c) {
         case OpCode::set_rlimit: return "set_rlimit";
         case OpCode::set_ids: return "set_ids";
         case OpCode::landlock_rule: return "landlock_rule";
+        case OpCode::landlock_rule_nofollow: return "landlock_rule_nofollow";
         case OpCode::landlock_net_rule: return "landlock_net";
         case OpCode::landlock_enforce: return "landlock_enforce";
         case OpCode::drop_caps: return "drop_caps";

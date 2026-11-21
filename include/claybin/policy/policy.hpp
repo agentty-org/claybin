@@ -152,6 +152,21 @@ struct PolicyData {
     // with. 0 with proxy_listener means "kernel's choice", reported back.
     std::uint16_t proxy_port{0};
 
+    // the fallback when there is NO network namespace to put the guest in.
+    //
+    // a supervisor that wanted a private netns + proxy (proxied_netns) can
+    // also run its proxy on the HOST's loopback at this port. compile() uses
+    // it only when net_namespaces is unavailable: landlock (abi 4+) then
+    // handles TCP connect and grants exactly this one port, and on abi 10+
+    // also handles UDP and grants nothing, so the guest's only route out is
+    // the supervisor's proxy, which applies the same name-based policy it
+    // would have applied through the namespace. without landlock net, the
+    // compile is refused rather than silently sharing the host network.
+    //
+    // 0 = no fallback: on a host without netns the guest shares the host
+    // network and net_isolation is reported `partial` (the old behaviour).
+    std::uint16_t host_proxy_port{0};
+
     // close every inherited descriptor above stderr before the guest runs.
     //
     // ON BY DEFAULT, and that is a deliberate difference from bubblewrap. an
@@ -223,6 +238,8 @@ struct PolicyData {
         // a channel is authority: it survives only if both sides offered it.
         r.proxy_listener = proxy_listener && o.proxy_listener;
         r.proxy_port = proxy_port ? proxy_port : o.proxy_port;
+        // the host-side fallback is a channel too: both must offer the same one.
+        r.host_proxy_port = host_proxy_port == o.host_proxy_port ? host_proxy_port : 0;
         // hardening: whichever side wants it, wins.
         r.close_inherited_fds = close_inherited_fds || o.close_inherited_fds;
         // capabilities are authority, so this is a real meet: a capability
@@ -355,7 +372,10 @@ class Policy<Draft> {
     // the sound way to express "everything under here except that", and the
     // one a credential mask needs: bind $HOME, then mask $HOME/.aws. `deny()`
     // cannot do this -- landlock has no negative rule (see MountKind::mask),
-    // so a deny under a grant is silently inherited.
+    // so a bare deny under a grant would be inherited. a mask holds on BOTH
+    // kinds of host: with a mount namespace it is an empty mount; without one
+    // compile() expands it into per-entry landlock grants on its siblings, or
+    // refuses to compile (see compile.cpp, "masks under a grant").
     Policy&& mask(std::string dst) && {
         data_.mounts.mask(std::move(dst));
         return std::move(*this);
@@ -557,6 +577,12 @@ class Policy<Draft> {
         data_.netns_with_loopback = true;
         data_.proxy_listener = true;
         data_.proxy_port = port;
+        return std::move(*this);
+    }
+    // see PolicyData::host_proxy_port: where the supervisor's proxy listens on
+    // the HOST loopback, for hosts that cannot give the guest a netns.
+    Policy&& host_proxy_fallback(std::uint16_t port) && {
+        data_.host_proxy_port = port;
         return std::move(*this);
     }
     // let the guest inherit the caller's open descriptors.

@@ -1474,15 +1474,20 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                     return die(Errc::permission_denied, "setuid", errno);
                 return true;
             }
-            case OpCode::landlock_rule: {
+            case OpCode::landlock_rule:
+            case OpCode::landlock_rule_nofollow: {
                 LandlockRuleOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "landlock", 0);
                 if (ll_fd < 0) return die(Errc::invalid_policy, "landlock: rule before enforce", 0);
                 const char* path = cstr(op.path);
                 if (!path) return die(Errc::invalid_policy, "landlock", 0);
 
-                long fd = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(path),
-                              O_PATH | O_CLOEXEC, 0);
+                // nofollow: if the entry became a symlink after compile, the fd
+                // names the LINK, and a rule on a link grants nothing beneath
+                // it -- the safe direction for a race.
+                const long oflags = O_PATH | O_CLOEXEC
+                    | (code == OpCode::landlock_rule_nofollow ? O_NOFOLLOW : 0);
+                long fd = sys(SYS_openat, AT_FDCWD, reinterpret_cast<long>(path), oflags, 0);
                 if (fd < 0) {
                     // a grant for a path that does not exist is not an escape
                     // risk -- there is nothing to reach -- so skip it rather

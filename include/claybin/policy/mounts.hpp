@@ -20,12 +20,33 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #include "claybin/core/fd.hpp"
 #include "claybin/core/lattice.hpp"
 #include "claybin/policy/filesystem.hpp"
 
 namespace clay {
+
+// is `link` already a symlink on THIS host pointing at exactly `target`? the
+// question a mountless backend asks of a symlink in the plan: if the answer is
+// yes, the tree it would have built is the tree that exists, and access
+// control over the real path stands in faithfully. readlink, not stat: a link
+// to the right place through a different spelling is a different link.
+inline bool host_symlink_matches(const std::string& link, const std::string& target) {
+#if defined(_WIN32)
+    (void)link;
+    (void)target;
+    return false;
+#else
+    char buf[4096];
+    const ssize_t n = ::readlink(link.c_str(), buf, sizeof buf);
+    if (n <= 0 || static_cast<std::size_t>(n) >= sizeof buf) return false;
+    return std::string_view{buf, static_cast<std::size_t>(n)} == target;
+#endif
+}
 
 enum class MountKind : std::uint8_t {
     bind,      // bind a host path in, read-write
@@ -429,8 +450,19 @@ class MountPlan {
                     why = "posix mqueue is linux-only";
                     break;
                 case MountKind::symlink:
-                    f = Fidelity::impossible;
-                    why = "creating a symlink would mutate the host filesystem";
+                    // on a merged-/usr host `/bin -> usr/bin` is already there:
+                    // the tree we would build and the tree that exists agree,
+                    // so access control over the real path is a faithful
+                    // stand-in. only a link that does NOT already exist with
+                    // this target would have to be created, which access
+                    // control cannot do.
+                    if (host_symlink_matches(m.dest, m.source)) {
+                        f = Fidelity::approximate;
+                        why = "symlink already present on the host; access control covers its target";
+                    } else {
+                        f = Fidelity::impossible;
+                        why = "creating a symlink would mutate the host filesystem";
+                    }
                     break;
                 case MountKind::mask:
                     // windows can do this one: an ACL denying the AppContainer

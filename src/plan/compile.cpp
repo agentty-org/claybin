@@ -1,9 +1,17 @@
 #include "claybin/plan/compile.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
 #if defined(_WIN32)
 #include <cstdint>
 #else
+#include <dirent.h>
+#include <cerrno>
 #include <unistd.h>
 #endif
 
@@ -11,6 +19,35 @@
 
 namespace clay {
 namespace {
+
+// the names in a directory, excluding "." and "..", or nullopt when it cannot
+// be listed or holds more than `cap` entries. used by mask expansion, which
+// runs in compile() -- before the fork, where allocating and calling libc is
+// fine -- and refuses rather than guesses when this says nullopt.
+std::optional<std::vector<std::string>> list_dir_entries(const std::string& dir,
+                                                         std::size_t cap) {
+#if defined(_WIN32)
+    (void)dir;
+    (void)cap;
+    return std::nullopt;
+#else
+    DIR* dp = ::opendir(dir.c_str());
+    if (!dp) return std::nullopt;
+    std::vector<std::string> out;
+    while (const dirent* e = ::readdir(dp)) {
+        const std::string_view n{e->d_name};
+        if (n == "." || n == "..") continue;
+        if (out.size() >= cap) {
+            ::closedir(dp);
+            return std::nullopt;
+        }
+        out.emplace_back(n);
+    }
+    ::closedir(dp);
+    std::sort(out.begin(), out.end());   // deterministic plans
+    return out;
+#endif
+}
 
 // The caller's uid/gid, for the uid_map/gid_map writes and the setids op.
 //
@@ -239,6 +276,26 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         && (!wants_net || d.netns_with_loopback);
     if (private_netns) unshare_flags |= kCloneNewnet;
 
+    // no netns, but the supervisor offered a proxy on the host loopback: the
+    // guest keeps the host network stack and landlock narrows it to that one
+    // port (see PolicyData::host_proxy_port). needs landlock net (abi 4);
+    // without it the request cannot be kept, so compile refuses rather than
+    // hand the guest the open host network it was supposed to be denied.
+    const bool host_proxy_fallback = wants_net && d.netns_with_loopback
+        && !host.net_namespaces && d.host_proxy_port != 0;
+    if (host_proxy_fallback && host.landlock_abi < 4)
+        return std::unexpected(Error{Errc::unsupported,
+            "no network namespace, and landlock is too old (abi < 4) to pin the "
+            "guest to the supervisor's proxy"});
+    // no netns and NO network authority: landlock net can still say "no TCP,
+    // no UDP" -- handle the rights and grant none. this turns "no network" on
+    // a userns-less host from a refusal (or worse, the open host network) into
+    // a kernel wall. ICMP ping sockets are outside landlock's net model, so
+    // the seccomp phase refuses them for both of these fallbacks.
+    const bool landlock_net_deny = !wants_net && !host.net_namespaces
+        && host.landlock_abi >= 4;
+    const bool no_netns_net_wall = host_proxy_fallback || landlock_net_deny;
+
     if (unshare_flags) b.op(OpCode::unshare, UnshareOp{unshare_flags});
 
     if (host.user_namespaces) {
@@ -301,13 +358,16 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     if (!wants_net) {
         if (host.net_namespaces)
             report.record(CapId::net_isolation, Enforcement::strong, "netns");
-        else
+        else if (!landlock_net_deny)
             degrade(CapId::net_isolation);
+        // else: recorded in the landlock phase, which enforces it.
     } else if (private_netns) {
         // the namespace is the boundary, so this is the same `strong` the
         // no-network case gets. what the guest may reach THROUGH a passed-in
         // descriptor is the caller's policy, not a weaker kernel wall.
         report.record(CapId::net_isolation, Enforcement::strong, "netns+loopback");
+    } else if (host_proxy_fallback) {
+        // recorded below, in the landlock phase, which is what enforces it.
     } else {
         // brokered network is only as strong as the notify supervisor, and we
         // have not built it yet. say so.
@@ -1029,7 +1089,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                            [](const NetEndpoint& e) { return e.port != 0; });
         std::uint64_t handled_net = 0;
         const bool want_net_rules = host.landlock_abi >= 4 && net_by_port;
-        if (want_net_rules) {
+        if (want_net_rules || no_netns_net_wall) {
             handled_net = kLlBindTcp | kLlConnectTcp;
             // UDP, where the kernel knows it. WITHOUT this the port
             // allowlist covers TCP only, and a guest under it still sends a
@@ -1085,7 +1145,222 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             }
         }
 
+        // ── masks under a grant (the no-mount-namespace case) ──────────────
+        //
+        // landlock has no negative rule (see below), so "grant D, deny D/x"
+        // cannot be said directly. it CAN be said as "grant every entry of D
+        // except x": a directory's own rights cover only what is beneath it,
+        // so the grant moves from D down to its children, and the masked child
+        // is simply not one of them. masks deeper than one level recurse down
+        // the chain (D, D/a, D/a/b, ...) doing the same at each level.
+        //
+        // what D itself keeps: read-dir (so `ls D` still works and lists x by
+        // name, which leaks a name, never content) and the create rights the
+        // grant had (so new files in D still work). it loses read-file on D's
+        // direct entries -- that is the point -- and an entry created in D
+        // AFTER compile is not readable until the next spawn. tools write into
+        // subdirectories far more than into the masked directory's top level,
+        // and every spawn recompiles, so in practice this is invisible.
+        //
+        // siblings are granted O_NOFOLLOW (landlock_rule_nofollow): a sibling
+        // that is a symlink to ~/.ssh must stay a rule on the LINK. following
+        // it would grant ~/.ssh itself, which is how a mask expansion could
+        // widen authority rather than narrow it.
+        //
+        // when a directory cannot be listed, or a level has more entries than
+        // the plan can sensibly carry, compile REFUSES with a named reason.
+        // dropping the mask and still reporting fs_read strong is the one
+        // outcome that is never acceptable -- it is what this code replaced.
+        std::vector<std::pair<std::string, std::uint64_t>> expanded;   // path, rights
+        std::vector<std::string> expanded_nofollow;
+        // every directory on a mask's chain. its plain rule must go even when
+        // the expansion emits nothing for it -- a chain dir whose only rights
+        // were read-file/execute would otherwise keep a rule that reaches the
+        // mask, which is the exact leak this replaces.
+        std::set<std::string> chain_dirs;
+        bool mask_unexpressible = false;
+        bool masks_per_entry = false;
+        std::string mask_dir;   // the directory that could not be listed
+        // only where the mount tree is NOT doing the masking. with a mount
+        // namespace the masked path is an empty mount, so there is nothing
+        // under it for an inherited landlock right to reach.
+        if (!building_tree) {
+            // NARROWINGS: a grant with fewer rights than some ancestor grant.
+            // a mask is the extreme one (nothing); a read-only bind of
+            // `.vscode/tasks.json` or `.git/hooks` inside a writable workspace
+            // is the other common one (the trust-handoff prevention). landlock
+            // rights only ADD UP down the tree, so neither can be said
+            // directly; both are said the same way: take the lost rights off
+            // every directory on the path to the narrowed entry, and grant
+            // each sibling along the way what it had. `lost[p]` is the set of
+            // rights the entry at p must not inherit.
+            std::map<std::string, std::uint64_t> lost;
+            for (const auto& g : effective.grants()) {
+                const std::uint64_t mine = to_landlock(g.rights, host.landlock_abi) & handled;
+                std::uint64_t above = 0;
+                for (const auto& a : effective.grants()) {
+                    if (a.path == g.path || a.rights.is_nothing()) continue;
+                    if (path::covers(a.path, g.path))
+                        above |= to_landlock(a.rights, host.landlock_abi) & handled;
+                }
+                if (above & ~mine) lost[g.path] = above & ~mine;
+            }
+            std::vector<std::string> denies;   // every narrowed entry
+            for (const auto& [p, _] : lost) denies.push_back(p);
+            auto is_deny = [&](const std::string& p) { return lost.contains(p); };
+
+            // landlock rights ACCUMULATE down the tree: every rule on every
+            // ancestor of a file contributes. so every grant that covers a
+            // mask has to be split, not just the nearest -- a read grant on
+            // `/` reaches the mask exactly as well as one on the workspace.
+            // walking from the OUTERMOST covering grant down puts every one of
+            // them on the chain, where it is replaced.
+            auto outermost_grant = [&](const std::string& p) -> const FsGrant* {
+                const FsGrant* best = nullptr;
+                for (const auto& g : effective.grants()) {
+                    if (g.rights.is_nothing() || g.path == p) continue;
+                    if (!path::covers(g.path, p)) continue;
+                    if (!best || g.path.size() < best->path.size()) best = &g;
+                }
+                return best;
+            };
+            auto rights_at = [&](const std::string& p) {
+                return to_landlock(effective.effective(p), host.landlock_abi) & handled;
+            };
+
+            // pass 1: every directory on some mask's chain, and which of its
+            // children are themselves on a chain. collected for ALL masks
+            // before anything is granted: two masks in one directory must each
+            // see the other as excluded, or the first one's siblings include
+            // the second mask and re-grant it.
+            std::map<std::string, std::set<std::string>> chain;   // dir -> chain children
+            std::map<std::string, std::uint64_t> chain_strip;     // dir -> rights it must drop
+            for (const auto& den : denies) {
+                const FsGrant* top = outermost_grant(den);
+                if (!top || rights_at(top->path) == 0) continue;   // unreachable anyway
+                // what the directories on the way down must give up for THIS
+                // entry. a mask (nothing granted) needs only read-file taken
+                // away: that is the right whose inheritance would let the guest
+                // learn the content, and keeping the rest lets work continue
+                // (see pass 2). any other narrowing -- a read-only bind under
+                // a writable dir -- gives up exactly what it lost.
+                const bool is_mask = effective.effective(den).is_nothing();
+                const std::uint64_t strip = is_mask ? (lost[den] & kLlReadFile) : lost[den];
+                if (strip == 0) continue;
+                // walk down only as far as the path EXISTS. a missing
+                // component means there is nothing under it to protect today;
+                // if the guest creates it, it creates it empty -- the secret
+                // is not there to read. mask_paths() lists credential
+                // locations for every tool, most of which a host does not have.
+                std::string dir = top->path;
+                while (dir != den) {
+                    const std::size_t from = dir == "/" ? 1 : dir.size() + 1;
+                    const std::string next = den.substr(0, den.find('/', from));
+                    if (::access(next.c_str(), F_OK) != 0 && errno == ENOENT) {
+                        // the path stops in `dir`: still record `dir` with
+                        // `next` as a chain child, so a later guest-created
+                        // `next` gets no inherited right either.
+                        chain[dir].insert(next);
+                        chain_strip[dir] |= strip;
+                        break;
+                    }
+                    chain[dir].insert(next);
+                    chain_strip[dir] |= strip;
+                    dir = next;
+                }
+            }
+
+            // pass 2: each chain directory keeps every right it had EXCEPT
+            // read-file, the one right an entry inherits that would let the
+            // guest learn the masked file's content. everything else stays:
+            //   * write/create: "must not READ a credential" is the property,
+            //     and writing inside the workspace is already allowed. so the
+            //     guest can overwrite or delete a masked workspace file, as it
+            //     could any workspace file -- it still never sees the original.
+            //   * execute: running a file reveals nothing (a script's
+            //     interpreter has to READ it, which is still denied), and
+            //     dropping it would break `./new.sh` right after creating it.
+            //   * read-dir: so `ls` works. it lists a masked entry's NAME,
+            //     never its content. a mount-ns mask hides the name too; this
+            //     is the one thing the per-entry form gives up.
+            // every entry NOT on a chain gets its own rule with the rights it
+            // had.
+            //
+            // why this does not let the guest MOVE the secret out from under
+            // the mask: renaming into another directory is a reparent, and with
+            // REFER handled (abi 2+) the kernel refuses any reparent that would
+            // give the file more access at the destination than it had; with
+            // abi 1 it refuses every reparent. a same-directory rename keeps
+            // the inode, and rules attach to inodes, so the new name is just as
+            // unreadable.
+            //
+            // this is a real limit of landlock (no negative rules, rights
+            // inherit to new entries), not a shortcut. measured cost: in ONE
+            // shell line, `echo x > ws/new && cat ws/new` fails at the cat
+            // when ws directly holds a mask; the next command reads it fine,
+            // because every spawn recompiles. fidelity is `approximate` and
+            // the report's mechanism says "per-entry masks".
+            constexpr std::size_t kMaxEntriesPerLevel = 4096;
+            for (const auto& [dir, on_chain] : chain) {
+                auto entries = list_dir_entries(dir, kMaxEntriesPerLevel);
+                if (!entries) {
+                    mask_unexpressible = true;
+                    mask_dir = dir;
+                    break;
+                }
+                chain_dirs.insert(dir);
+                // a chain dir drops what the narrowed entries below it must not
+                // inherit -- computed in pass 1 (chain_strip), and for a mask
+                // reduced to read-file (see `strip_for` there). never more: a
+                // chain dir keeps everything that is safe, so ordinary work in
+                // it goes on.
+                const std::uint64_t own = rights_at(dir) & ~chain_strip[dir];
+                if (own) expanded.emplace_back(dir, own);
+                for (const auto& name : *entries) {
+                    const std::string child = dir == "/" ? "/" + name : dir + "/" + name;
+                    if (on_chain.contains(child)) continue;
+                    if (is_deny(child)) {
+                        // a narrowed entry directly in this dir: exactly its
+                        // own rights (none for a mask, read+exec for a
+                        // read-only bind).
+                        const std::uint64_t own_r = to_landlock(effective.effective(child),
+                                                                host.landlock_abi) & handled;
+                        if (own_r) {
+                            expanded.emplace_back(child, own_r);
+                            expanded_nofollow.push_back(child);
+                        }
+                        continue;
+                    }
+                    const std::uint64_t child_rights = rights_at(child);
+                    if (child_rights == 0) continue;
+                    expanded.emplace_back(child, child_rights);
+                    expanded_nofollow.push_back(child);
+                }
+            }
+            if (!chain.empty() && !mask_unexpressible) {
+                out.fidelity = clay::meet(out.fidelity, Fidelity::approximate);
+                masks_per_entry = true;
+            }
+        }
+        if (mask_unexpressible) {
+            // Error carries a static string, so the directory goes to stderr
+            // for whoever is debugging; the mechanism names the failure.
+            std::fprintf(stderr, "claybin: cannot list %s to express a mask under it\n",
+                         mask_dir.c_str());
+            return std::unexpected(Error{Errc::unsupported,
+                "a mask under a landlock grant needs its directory listed, "
+                "and it cannot be (unreadable, or too many entries)"});
+        }
+
+        // the grants whose own rule the expansion replaced. a split directory
+        // must NOT keep its plain rule, or that rule's read-file reaches the
+        // masked child again.
+        std::set<std::string> replaced_paths = chain_dirs;
+        for (const auto& [p, _] : expanded) replaced_paths.insert(p);
+        auto replaced = [&](const std::string& p) { return replaced_paths.contains(p); };
+
         for (const auto& g : effective.grants()) {
+            if (replaced(g.path)) continue;
             // a rule may only allow what the ruleset handles. masking here
             // rather than trusting the translation keeps a future FileRights
             // bit from silently breaking every sandbox.
@@ -1111,12 +1386,41 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             if (allowed == 0) continue;
             b.op(OpCode::landlock_rule, LandlockRuleOp{b.intern(g.path), allowed});
         }
+        for (const auto& [p, rights] : expanded) {
+            const bool nofollow = std::find(expanded_nofollow.begin(),
+                                            expanded_nofollow.end(), p)
+                                  != expanded_nofollow.end();
+            b.op(nofollow ? OpCode::landlock_rule_nofollow : OpCode::landlock_rule,
+                 LandlockRuleOp{b.intern(p), rights});
+        }
         // network rules, one per allowed port. a port of 0 means "any", which
         // landlock cannot express -- so in that case we install no net rules and
         // the report says `partial` rather than pretending the ports were
         // enforced.
         bool net_fully_enforced = want_net_rules;
-        if (want_net_rules) {
+        if (host_proxy_fallback) {
+            // exactly one route out: TCP to the supervisor's proxy port. no
+            // UDP grant at all (handled on abi 10+, so every datagram is
+            // refused -- DNS included, which is right: the proxy resolves
+            // names for the guest). on abi 4-9 UDP is not mediated, which the
+            // report says by staying `partial`.
+            b.op(OpCode::landlock_net_rule,
+                 LandlockNetRuleOp{kLlConnectTcp, d.host_proxy_port, {}});
+            const bool udp_covered = (handled_net & kLlConnectSendUdp) != 0;
+            report.record(CapId::net_isolation,
+                          udp_covered ? Enforcement::strong : Enforcement::partial,
+                          udp_covered ? "landlock net: proxy port only (tcp+udp)"
+                                      : "landlock net: proxy port only (tcp; udp unmediated)");
+            net_fully_enforced = false;   // reported here, not as per-port rules
+        } else if (landlock_net_deny) {
+            // handled, no grants: every TCP connect/bind (and UDP on abi 10+)
+            // is refused by the kernel.
+            const bool udp_covered = (handled_net & kLlConnectSendUdp) != 0;
+            report.record(CapId::net_isolation,
+                          udp_covered ? Enforcement::strong : Enforcement::partial,
+                          udp_covered ? "landlock net: no tcp/udp (no netns)"
+                                      : "landlock net: no tcp (no netns; udp unmediated)");
+        } else if (want_net_rules) {
             // UDP needs one extra grant that TCP does not, and the kernel
             // documents it: sending a datagram AUTO-BINDS the socket to an
             // ephemeral local port, so handling BIND_UDP without allowing
@@ -1187,12 +1491,51 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         }
 
         b.op(OpCode::landlock_enforce,
-             LandlockEnforceOp{handled, net_fully_enforced ? handled_net : 0, scoped,
-                               host.landlock_abi, 0});
+             LandlockEnforceOp{handled,
+                               (net_fully_enforced || no_netns_net_wall) ? handled_net : 0,
+                               scoped, host.landlock_abi, 0});
 
-        report.record(CapId::fs_read, Enforcement::strong, "landlock");
-        report.record(CapId::fs_write, Enforcement::strong, "landlock");
-        report.record(CapId::fs_exec, Enforcement::strong, "landlock");
+        // the mechanism names the per-entry form when it ran: still strong
+        // (the kernel denies the masked path), but a reader of the report
+        // should be able to tell it from the mount tree.
+        //
+        // one more honesty check before claiming `strong`: a NON-mask grant
+        // narrower than an ancestor's (a read-only path inside a writable
+        // workspace) has no landlock expression -- rights only add up down the
+        // tree -- so without a mount tree the narrower grant is simply not
+        // enforced. masks are expanded above; these are not, because splitting
+        // a writable directory into per-entry rules would make every file
+        // created in it unwritable until the next spawn. the guarantee drops
+        // to `partial` for each right that some such grant loses.
+        std::uint64_t unenforced = 0;
+        if (!building_tree) {
+            const auto& gs = effective.grants();
+            for (const auto& g : gs) {
+                if (g.rights.is_nothing()) continue;   // masks: handled above
+                const std::uint64_t mine = to_landlock(g.rights, host.landlock_abi) & handled;
+                for (const auto& a : gs) {
+                    if (a.rights.is_nothing() || a.path == g.path) continue;
+                    if (!path::covers(a.path, g.path)) continue;
+                    unenforced |= (to_landlock(a.rights, host.landlock_abi) & handled) & ~mine;
+                }
+            }
+        }
+        constexpr std::uint64_t kWriteBits = kLlWriteFile | kLlRemoveDir | kLlRemoveFile
+            | kLlMakeChar | kLlMakeDir | kLlMakeReg | kLlMakeSock | kLlMakeFifo | kLlMakeBlock
+            | kLlMakeSym | kLlRefer | kLlTruncate;
+        const char* kNarrowWhy =
+            "landlock; read-only paths under writable ones need a mount namespace";
+        report.record(CapId::fs_read,
+                      (unenforced & (kLlReadFile | kLlReadDir)) ? Enforcement::partial
+                                                                : Enforcement::strong,
+                      (unenforced & (kLlReadFile | kLlReadDir)) ? kNarrowWhy
+                      : masks_per_entry ? "landlock (per-entry masks)" : "landlock");
+        report.record(CapId::fs_write,
+                      (unenforced & kWriteBits) ? Enforcement::partial : Enforcement::strong,
+                      (unenforced & kWriteBits) ? kNarrowWhy : "landlock");
+        report.record(CapId::fs_exec,
+                      (unenforced & kLlExecute) ? Enforcement::partial : Enforcement::strong,
+                      (unenforced & kLlExecute) ? kNarrowWhy : "landlock");
         if (net_fully_enforced) {
             // per-port TCP control, which a netns cannot give us. this is the one
             // case where granting network does NOT mean giving up enforcement.
@@ -1208,6 +1551,23 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
     // -- phase: seccomp (last wall) ---------------------------------------
     if (host.seccomp) {
         SyscallPolicy sys = d.syscalls;
+        // ping sockets (SOCK_DGRAM + IPPROTO_ICMP/ICMPV6) reach the network
+        // without TCP or UDP, so landlock's net rules never see them. where
+        // landlock net is the only network wall (no netns), refuse them: an
+        // echo payload is a working exfiltration channel. inside a netns there
+        // is nowhere for them to go, so nothing is lost by refusing them there
+        // too, but this only adds the rule where it is load-bearing.
+        if (no_netns_net_wall) {
+#if defined(__x86_64__)
+            constexpr SysNr kSocketNr = 41;
+#elif defined(__aarch64__)
+            constexpr SysNr kSocketNr = 198;
+#endif
+#if defined(__x86_64__) || defined(__aarch64__)
+            sys.deny_arg32(kSocketNr, 2, 1 /* IPPROTO_ICMP */, SysAction::errno_, 13);
+            sys.deny_arg32(kSocketNr, 2, 58 /* IPPROTO_ICMPV6 */, SysAction::errno_, 13);
+#endif
+        }
         if (sys.default_action() == SysAction::kill_process && sys.rules().empty()) {
             // a policy that never named a syscall would kill the child before it
             // could exec. that is a policy bug, not something to paper over.
@@ -1253,7 +1613,19 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // grant: it has no descriptor to send on once the handshake fd is closed.
         if (wants_notify) sys.allow(46 /* sendmsg */);
 
-        auto prog = bpf::compile(sys, d.syscalls_i386);
+        std::optional<SyscallPolicy> compat_sys = d.syscalls_i386;
+#if defined(__x86_64__)
+        // the same ping-socket rule for 32-bit programs, which get their own
+        // filter selected by audit arch. socketcall is already ENOSYS there,
+        // so the direct socket call (359) is the only door.
+        if (no_netns_net_wall && compat_sys) {
+            compat_sys->deny_arg32(359 /* socket */, 2, 1 /* IPPROTO_ICMP */,
+                                   SysAction::errno_, 13);
+            compat_sys->deny_arg32(359 /* socket */, 2, 58 /* IPPROTO_ICMPV6 */,
+                                   SysAction::errno_, 13);
+        }
+#endif
+        auto prog = bpf::compile(sys, compat_sys);
         if (!prog) return std::unexpected(prog.error());
 
         auto blob = std::span<const std::byte>{
