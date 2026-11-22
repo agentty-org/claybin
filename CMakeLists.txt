@@ -159,6 +159,7 @@ if(CLAYBIN_TESTS)
   # when run under `bwrap --unshare-user --disable-userns` (CI does).
   claybin_test(mask_landlock_test)
   claybin_test(net_landlock_test)
+  claybin_test(stdin_eof_test)
   claybin_test(shapes_test)
   claybin_test(windows_backend_test)
   # the macOS backend's translation. runs on EVERY host, not just a mac --

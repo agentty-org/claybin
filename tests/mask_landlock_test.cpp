@@ -141,6 +141,23 @@ int run_attack(const char* name, const std::string& ws, const std::string& outsi
         return 0;
     }
     // controls: must SUCCEED, or the walls are too broad to live with.
+    //
+    // The two "new file" controls are the ones that matter most: a new file
+    // directly in the workspace root, and one beside a read-only directory
+    // (git writes .git/index.lock right beside .git/hooks). An earlier version
+    // made read-only paths hold here by taking write off every directory
+    // above them, and broke exactly these -- every `git commit` on a host with
+    // no user namespaces.
+    if (!std::strcmp(name, "ok_write_new_in_root") || !std::strcmp(name, "ok_write_new_beside_ro_dir")) {
+        const std::string p = !std::strcmp(name, "ok_write_new_in_root")
+                                  ? ws + "/new_in_root.txt" : ws + "/beside_hooks.lock";
+        const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return 1;
+        const bool ok = ::write(fd, "CANARY", 6) == 6;
+        ::close(fd);
+        ::unlink(p.c_str());
+        return ok ? 42 : 1;
+    }
     if (!std::strcmp(name, "ok_read_ro")) return read_canary(ws + "/ro.json") ? 42 : 1;
     if (!std::strcmp(name, "ok_sibling_read")) return read_canary(ws + "/ok.txt") ? 42 : 1;
     if (!std::strcmp(name, "ok_nested_read")) return read_canary(ws + "/src/a.c") ? 42 : 1;
@@ -272,12 +289,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- 2. live, only where namespaces are genuinely unavailable ----------
-    if (real.user_namespaces) {
-        std::fprintf(stderr, "  (live attacks skipped: this host has user namespaces; "
-                             "run under bwrap --unshare-user --disable-userns)\n");
-        return finish("mask_landlock_test");
-    }
+    // ---- 2. live, on THIS host -------------------------------------------
+    // with namespaces this exercises the mount tree; under
+    // `bwrap --unshare-user --disable-userns` (CI) it exercises landlock alone.
+    if (real.user_namespaces)
+        std::fprintf(stderr, "  (this host has user namespaces: the mount tree is "
+                             "tested; CI runs the landlock-only path)\n");
     auto c = compile(make_policy(f, self_dir), real);
     CHECK(c.has_value());
     if (!c) return finish("mask_landlock_test");
@@ -285,13 +302,27 @@ int main(int argc, char** argv) {
     for (const char* a : {"read", "read_nested", "proc_root", "rename_same_dir",
                           "rename_to_sibling", "hardlink", "symlink",
                           "presymlinked_sibling", "outside_direct",
-                          "overwrite_then_read", "rename_parent_dir",
-                          "write_ro_file", "write_ro_dir"}) {
+                          "overwrite_then_read", "rename_parent_dir"}) {
         const int rc = attack(*c, self, a, f);
         if (rc == 0) std::fprintf(stderr, "  ESCAPED: %s\n", a);
         CHECK(rc > 0 && rc != 42);
     }
-    for (const char* ok : {"ok_sibling_read", "ok_nested_read", "ok_write", "ok_read_ro"}) {
+    // read-only paths INSIDE the writable workspace: only a mount tree can
+    // hold them (landlock rights add up down the tree, so keeping hooks/
+    // read-only would take write off its parents). With namespaces they must
+    // hold; without, the report must say filesystem.write is partial.
+    if (real.mount_namespaces) {
+        for (const char* a : {"write_ro_file", "write_ro_dir"}) {
+            const int rc = attack(*c, self, a, f);
+            if (rc == 0) std::fprintf(stderr, "  ESCAPED: %s\n", a);
+            CHECK(rc > 0 && rc != 42);
+        }
+    } else {
+        CHECK(c->guarantees.strength(CapId::fs_write) == Enforcement::partial);
+    }
+
+    for (const char* ok : {"ok_sibling_read", "ok_nested_read", "ok_write", "ok_read_ro",
+                           "ok_write_new_in_root", "ok_write_new_beside_ro_dir"}) {
         const int rc = attack(*c, self, ok, f);
         if (rc != 42) std::fprintf(stderr, "  control failed: %s (rc=%d)\n", ok, rc);
         CHECK(rc == 42);

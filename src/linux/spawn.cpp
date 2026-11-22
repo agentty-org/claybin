@@ -355,6 +355,30 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // is not (see the shepherd).
         auto st = plan.apply_until(Phase::mounts, afds);
 
+        // the one descriptor the pid-1 shepherd must keep: the proxy listener
+        // (see the handoff below). everything else the waiting processes hold
+        // is a copy of the CALLER's table, taken at fork -- they never exec,
+        // so CLOEXEC does nothing for them. a copy of the write end of the
+        // guest's stdin pipe held there means the guest never reads EOF, and
+        // a long-lived child (an MCP server) cannot be told to finish.
+        int shepherd_keep_fd = -1;
+        // close every fd >= 3 except `keep`. raw close_range (5.9+); a loop
+        // where it is missing. async-signal-safe either way.
+        auto close_inherited = [](int keep) {
+            constexpr long kSysCloseRange = 436;
+            constexpr unsigned kMax = ~0u;
+            bool ok = true;
+            if (keep > 3)
+                ok = ::syscall(kSysCloseRange, 3u, static_cast<unsigned>(keep - 1), 0u) == 0;
+            if (ok) {
+                const unsigned from = keep >= 3 ? static_cast<unsigned>(keep + 1) : 3u;
+                ok = ::syscall(kSysCloseRange, from, kMax, 0u) == 0;
+            }
+            if (!ok)
+                for (int fd = 3; fd < 4096; ++fd)
+                    if (fd != keep) ::close(fd);
+        };
+
         // PROXY LISTENER HANDOFF, before the fork into the pid namespace.
         //
         // The listener was opened by the namespace phase, in THIS process. It
@@ -366,6 +390,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
         // not set yet, so one SCM_RIGHTS sendmsg is enough.
         if (st && afds.proxy_listen_fd >= 0) {
             const int pfd = std::exchange(afds.proxy_listen_fd, -1);
+            shepherd_keep_fd = pfd;
             struct iovec iov{};
             const std::uint16_t port = afds.proxy_port;
             char payload[11] = {'P', static_cast<char>(port & 0xff),
@@ -437,6 +462,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
                 // the outer child is outside the new pid namespace (unshare only
                 // moves our CHILDREN in), so it just mirrors the exit status.
                 ::close(report[1]);
+                close_inherited(-1);   // it needs nothing: pid 1 holds the listener
                 int wst = 0;
                 while (::waitpid(inner, &wst, 0) < 0 && errno == EINTR) {
                 }
@@ -469,6 +495,7 @@ Result<Spawned> spawn_in(const Plan& plan, const Command& cmd, const cgroup::Gro
                 }
                 if (guest > 0) {
                     ::close(report[1]);
+                    close_inherited(shepherd_keep_fd);
                     // blank the argv we inherited, so /proc/1/cmdline inside the
                     // sandbox reads empty instead of the supervisor's command
                     // line. plain stores, no libc: we are post-fork.

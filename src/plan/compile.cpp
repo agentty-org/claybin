@@ -1186,24 +1186,25 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
         // under it for an inherited landlock right to reach.
         if (!building_tree) {
             // NARROWINGS: a grant with fewer rights than some ancestor grant.
-            // a mask is the extreme one (nothing); a read-only bind of
-            // `.vscode/tasks.json` or `.git/hooks` inside a writable workspace
-            // is the other common one (the trust-handoff prevention). landlock
-            // rights only ADD UP down the tree, so neither can be said
-            // directly; both are said the same way: take the lost rights off
-            // every directory on the path to the narrowed entry, and grant
-            // each sibling along the way what it had. `lost[p]` is the set of
-            // rights the entry at p must not inherit.
+            // Only MASKS are expanded here. A mask needs just read-file taken
+            // off the directories above it, which costs nothing ordinary work
+            // needs. A read-only path under a writable one (.git/hooks,
+            // .vscode/tasks.json) would need the WRITE rights taken off every
+            // directory above it -- the workspace root and .git included --
+            // and then a new file there (git's index.lock) cannot be created.
+            // That trade is wrong, so those stay unexpanded: the report says
+            // filesystem.write `partial` and the host's handoff detection is
+            // the wall (it runs on every host for exactly this reason).
             std::map<std::string, std::uint64_t> lost;
             for (const auto& g : effective.grants()) {
-                const std::uint64_t mine = to_landlock(g.rights, host.landlock_abi) & handled;
+                if (!g.rights.is_nothing()) continue;   // masks only (see above)
                 std::uint64_t above = 0;
                 for (const auto& a : effective.grants()) {
                     if (a.path == g.path || a.rights.is_nothing()) continue;
                     if (path::covers(a.path, g.path))
                         above |= to_landlock(a.rights, host.landlock_abi) & handled;
                 }
-                if (above & ~mine) lost[g.path] = above & ~mine;
+                if (above) lost[g.path] = above;
             }
             std::vector<std::string> denies;   // every narrowed entry
             for (const auto& [p, _] : lost) denies.push_back(p);
@@ -1238,14 +1239,11 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
             for (const auto& den : denies) {
                 const FsGrant* top = outermost_grant(den);
                 if (!top || rights_at(top->path) == 0) continue;   // unreachable anyway
-                // what the directories on the way down must give up for THIS
-                // entry. a mask (nothing granted) needs only read-file taken
-                // away: that is the right whose inheritance would let the guest
+                // a mask needs only read-file taken off the directories above
+                // it: that is the right whose inheritance would let the guest
                 // learn the content, and keeping the rest lets work continue
-                // (see pass 2). any other narrowing -- a read-only bind under
-                // a writable dir -- gives up exactly what it lost.
-                const bool is_mask = effective.effective(den).is_nothing();
-                const std::uint64_t strip = is_mask ? (lost[den] & kLlReadFile) : lost[den];
+                // (see pass 2).
+                const std::uint64_t strip = lost[den] & kLlReadFile;
                 if (strip == 0) continue;
                 // walk down only as far as the path EXISTS. a missing
                 // component means there is nothing under it to protect today;
@@ -1320,18 +1318,7 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 for (const auto& name : *entries) {
                     const std::string child = dir == "/" ? "/" + name : dir + "/" + name;
                     if (on_chain.contains(child)) continue;
-                    if (is_deny(child)) {
-                        // a narrowed entry directly in this dir: exactly its
-                        // own rights (none for a mask, read+exec for a
-                        // read-only bind).
-                        const std::uint64_t own_r = to_landlock(effective.effective(child),
-                                                                host.landlock_abi) & handled;
-                        if (own_r) {
-                            expanded.emplace_back(child, own_r);
-                            expanded_nofollow.push_back(child);
-                        }
-                        continue;
-                    }
+                    if (is_deny(child)) continue;   // a mask: no rule at all
                     const std::uint64_t child_rights = rights_at(child);
                     if (child_rights == 0) continue;
                     expanded.emplace_back(child, child_rights);
