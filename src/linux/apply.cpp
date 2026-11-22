@@ -1541,7 +1541,19 @@ Status Plan::apply_range(Phase first, Phase last, ApplyFds& fds) const {
                 LandlockEnforceOp op{};
                 if (!decode(payload, op)) return die(Errc::invalid_policy, "landlock", 0);
                 if (ll_fd < 0) return die(Errc::invalid_policy, "landlock: no ruleset", 0);
-                if (sys(kSysLandlockRestrictSelf, ll_fd, 0) < 0)
+                // abi 7+: log denials made AFTER the exec too. by default the
+                // kernel audits only the program that called restrict_self,
+                // which is this apply code, so every denial the guest itself
+                // hit went unrecorded. LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON
+                // puts them in the audit log (ausearch -m LANDLOCK_ACCESS)
+                // wherever auditing is on; it costs nothing where it is off.
+                // a kernel that reports 7 but refuses the flag gets the plain
+                // call: the wall matters, the log does not.
+                constexpr unsigned kLogNewExecOn = 1u << 1;
+                long rc = -1;
+                if (op.abi >= 7) rc = sys(kSysLandlockRestrictSelf, ll_fd, kLogNewExecOn);
+                if (rc < 0) rc = sys(kSysLandlockRestrictSelf, ll_fd, 0);
+                if (rc < 0)
                     return die(Errc::permission_denied, "landlock_restrict_self", errno);
                 sys(SYS_close, ll_fd);
                 ll_fd = -1;
