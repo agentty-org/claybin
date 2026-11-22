@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <set>
@@ -11,7 +12,6 @@
 #include <cstdint>
 #else
 #include <dirent.h>
-#include <cerrno>
 #include <unistd.h>
 #endif
 
@@ -1256,7 +1256,8 @@ Result<Compiled> compile(const Policy<Sealed>& policy, const HostCapabilities& h
                 while (dir != den) {
                     const std::size_t from = dir == "/" ? 1 : dir.size() + 1;
                     const std::string next = den.substr(0, den.find('/', from));
-                    if (::access(next.c_str(), F_OK) != 0 && errno == ENOENT) {
+                    std::error_code exists_ec;
+                    if (!std::filesystem::exists(std::filesystem::symlink_status(next, exists_ec))) {
                         // the path stops in `dir`: still record `dir` with
                         // `next` as a chain child, so a later guest-created
                         // `next` gets no inherited right either.
